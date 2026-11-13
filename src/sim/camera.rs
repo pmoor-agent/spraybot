@@ -92,6 +92,30 @@ impl CameraRig {
         self.desired_distance = dist.clamp(MIN_DISTANCE, MAX_DISTANCE);
     }
 
+    /// Updates Follow target tracking (holding `desired_target` frozen while `is_shaking`
+    /// is true) and advances exponential smoothing for target, orbit, and zoom over `dt`.
+    pub fn step_tracking(&mut self, nozzle_world_pos: Vec3, is_shaking: bool, dt: f32) {
+        // Freeze desired_target during ShakeCan so the Follow camera stays rock steady.
+        if self.active_preset == Some(CameraPreset::Follow) && !is_shaking {
+            self.desired_target = clamp_target_inside_studio(nozzle_world_pos);
+        }
+
+        // Softer target damping in Follow mode for smooth sweeping paint strokes;
+        // faster damping for discrete preset jumps and manual pan.
+        let target_rate = if self.active_preset == Some(CameraPreset::Follow) {
+            4.5
+        } else {
+            8.0
+        };
+        let target_alpha = 1.0 - (-target_rate * dt).exp();
+        let orbit_alpha = 1.0 - (-16.0 * dt).exp();
+
+        self.current_target = self.current_target.lerp(self.desired_target, target_alpha);
+        self.current_yaw += (self.desired_yaw - self.current_yaw) * orbit_alpha;
+        self.current_pitch += (self.desired_pitch - self.current_pitch) * orbit_alpha;
+        self.current_distance += (self.desired_distance - self.current_distance) * orbit_alpha;
+    }
+
     /// Computes the camera world eye position and clamps it inside the studio walls (`Y >= 0.08m`).
     pub fn clamped_eye(&self) -> Vec3 {
         let raw_eye = spherical_to_cartesian(
@@ -288,12 +312,6 @@ fn update_camera_rig(
             (rig.desired_distance * (-scroll_y * 0.12).exp()).clamp(MIN_DISTANCE, MAX_DISTANCE);
     }
 
-    // Follow preset smoothly tracks the active TCP / nozzle zone.
-    if rig.active_preset == Some(CameraPreset::Follow) {
-        let nozzle = job.current_frame.nozzle_world_pos;
-        rig.desired_target = clamp_target_inside_studio(nozzle);
-    }
-
     // Use deterministic step dt during recording so follow-cam motion is lockstep-smooth.
     let dt = if app_config.cli.record.is_some() {
         let fps = app_config.cli.fps.max(1) as f32;
@@ -306,14 +324,11 @@ fn update_camera_rig(
         time.delta_secs().min(0.1)
     };
 
-    let target_alpha = 1.0 - (-8.0 * dt).exp();
-    let orbit_alpha = 1.0 - (-16.0 * dt).exp();
-
-    rig.current_target = rig.current_target.lerp(rig.desired_target, target_alpha);
-    rig.current_yaw = rig.current_yaw + (rig.desired_yaw - rig.current_yaw) * orbit_alpha;
-    rig.current_pitch = rig.current_pitch + (rig.desired_pitch - rig.current_pitch) * orbit_alpha;
-    rig.current_distance =
-        rig.current_distance + (rig.desired_distance - rig.current_distance) * orbit_alpha;
+    rig.step_tracking(
+        job.current_frame.nozzle_world_pos,
+        job.current_frame.is_shaking,
+        dt,
+    );
 
     let clamped_eye = rig.clamped_eye();
     for mut transform in cam_query.iter_mut() {
@@ -626,5 +641,77 @@ mod tests {
         assert!(text2.contains("None"));
         assert!(text2.contains("Fat Cap (12°)"));
         assert!(text2.contains("Gizmos: OFF"));
+    }
+
+    #[test]
+    fn follow_camera_freezes_target_during_shake_and_tracks_smoothly_when_not_shaking() {
+        let initial_nozzle = Vec3::new(-0.40, 1.35, 0.45);
+        let mut rig = CameraRig::from_preset(CameraPreset::Follow, initial_nozzle);
+        let pre_shake_target = rig.current_target;
+        assert_relative_eq!(pre_shake_target.x, initial_nozzle.x, epsilon = 1e-6);
+        assert_relative_eq!(pre_shake_target.y, initial_nozzle.y, epsilon = 1e-6);
+        assert_relative_eq!(pre_shake_target.z, initial_nozzle.z, epsilon = 1e-6);
+
+        // During ShakeCan (is_shaking == true), oscillating nozzle must NOT move desired_target or current_target.
+        // Orbit/zoom should still respond smoothly while target stays frozen.
+        rig.desired_yaw += 0.25;
+        for step in 0..30 {
+            let phase = (step as f32) * 0.45;
+            let shaking_nozzle = initial_nozzle + Vec3::new(0.06 * phase.sin(), 0.12 * phase.cos(), 0.04 * phase.sin());
+            rig.step_tracking(shaking_nozzle, true, 1.0 / 60.0);
+            assert_relative_eq!(rig.desired_target.x, pre_shake_target.x, epsilon = 1e-6);
+            assert_relative_eq!(rig.desired_target.y, pre_shake_target.y, epsilon = 1e-6);
+            assert_relative_eq!(rig.desired_target.z, pre_shake_target.z, epsilon = 1e-6);
+            assert_relative_eq!(rig.current_target.x, pre_shake_target.x, epsilon = 1e-6);
+            assert_relative_eq!(rig.current_target.y, pre_shake_target.y, epsilon = 1e-6);
+            assert_relative_eq!(rig.current_target.z, pre_shake_target.z, epsilon = 1e-6);
+        }
+        assert!(
+            (rig.current_yaw - rig.desired_yaw).abs() < 0.01,
+            "orbit should remain responsive while shake freezes target"
+        );
+
+        // After ShakeCan ends (is_shaking == false), Follow smoothly tracks the new nozzle position
+        // using the softer 4.5 exponential rate (not snapping instantaneously).
+        let target_nozzle = Vec3::new(0.45, 1.65, 0.16);
+        let dt = 1.0 / 60.0;
+        rig.step_tracking(target_nozzle, false, dt);
+        assert_relative_eq!(rig.desired_target.x, target_nozzle.x, epsilon = 1e-6);
+        assert_relative_eq!(rig.desired_target.y, target_nozzle.y, epsilon = 1e-6);
+        assert_relative_eq!(rig.desired_target.z, target_nozzle.z, epsilon = 1e-6);
+
+        let expected_alpha = 1.0 - (-4.5 * dt).exp();
+        let expected_after_one = pre_shake_target.lerp(target_nozzle, expected_alpha);
+        assert_relative_eq!(rig.current_target.x, expected_after_one.x, epsilon = 1e-5);
+        assert_relative_eq!(rig.current_target.y, expected_after_one.y, epsilon = 1e-5);
+        assert_relative_eq!(rig.current_target.z, expected_after_one.z, epsilon = 1e-5);
+
+        // After ~1.5s of steady tracking, camera converges smoothly near target_nozzle
+        for _ in 0..90 {
+            rig.step_tracking(target_nozzle, false, dt);
+        }
+        assert!((rig.current_target - target_nozzle).length() < 0.005);
+    }
+
+    #[test]
+    fn discrete_preset_jump_uses_faster_damping_than_follow_tracking() {
+        let start = Vec3::new(0.0, 1.5, 0.2);
+        let dest = Vec3::new(1.0, 1.5, 0.2);
+        let dt = 1.0 / 60.0;
+
+        let mut follow_rig = CameraRig::from_preset(CameraPreset::Follow, start);
+        follow_rig.step_tracking(dest, false, dt);
+        let follow_progress = follow_rig.current_target.x;
+
+        let mut overview_rig = CameraRig::from_preset(CameraPreset::Follow, start);
+        overview_rig.apply_preset(CameraPreset::Overview, start);
+        overview_rig.desired_target = dest;
+        overview_rig.step_tracking(dest, false, dt);
+        let preset_progress = overview_rig.current_target.x;
+
+        assert!(
+            preset_progress > follow_progress * 1.4,
+            "discrete preset jump ({preset_progress}) should damp faster than Follow ({follow_progress})"
+        );
     }
 }

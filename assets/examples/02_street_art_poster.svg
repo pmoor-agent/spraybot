@@ -107,12 +107,12 @@
   </g>
 
   <!-- Accent banner & subtitle typography -->
-  <rect x="542" y="274" width="385" height="44" rx="6" fill="#FF2E63"/>
+  <rect x="542" y="274" width="410" height="44" rx="6" fill="#FF2E63"/>
   <text x="560" y="306" font-family="Montserrat, Liberation Sans, sans-serif" font-weight="800" font-size="26" letter-spacing="3" fill="#FFFFFF">URBAN MURAL STUDIO</text>
 
   <!-- Stencil badge in bottom right -->
-  <rect x="650" y="445" width="290" height="42" rx="4" fill="#FFD166" opacity="0.92"/>
-  <text x="670" y="474" font-family="Montserrat, Liberation Sans, sans-serif" font-weight="700" font-size="22" letter-spacing="2" fill="#120C1F">UNIT-07 // 2.5M WALL</text>
+  <rect x="632" y="445" width="320" height="42" rx="4" fill="#FFD166" opacity="0.92"/>
+  <text x="649" y="474" font-family="Montserrat, Liberation Sans, sans-serif" font-weight="700" font-size="22" letter-spacing="2" fill="#120C1F">UNIT-07 // 2.5M WALL</text>
 
   <!-- Outer poster border -->
   <rect x="28" y="28" width="944" height="544" rx="10" fill="none" stroke="#FFFFFF" stroke-width="6" opacity="0.35"/>

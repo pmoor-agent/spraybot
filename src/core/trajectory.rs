@@ -19,6 +19,8 @@ const SHAKE_DURATION: f64 = 1.1;
 const SHAKE_FREQ_HZ: f64 = 6.0;
 /// Shake oscillation amplitude in radians (`±22°`).
 const SHAKE_AMP_RAD: f64 = 22.0_f64 * PI / 180.0;
+/// Unobstructed side park pose at the right end of the rail (`q0 = 1.38m > +1.25m` canvas edge).
+const PARK_HOME_JOINTS: [f64; 7] = [1.38, -0.35, -0.55, 1.40, 0.0, -0.85, 0.0];
 
 /// Symmetric smooth-ramp (`C²` continuous) S-curve 1D time-scaling profile on `[0, duration]`.
 #[derive(Debug, Clone, Copy)]
@@ -163,9 +165,10 @@ impl CompiledTimeline {
     pub fn empty() -> Self {
         let studio = StudioConfig::default();
         let chain = KinematicChain::default_spraybot(&studio);
+        let home = chain.clamp_joints(&PARK_HOME_JOINTS);
         Self {
             total_duration: 0.0,
-            home_joints: chain.comfort_pose,
+            home_joints: home,
             chain,
             segments: Vec::new(),
         }
@@ -201,7 +204,7 @@ impl CompiledTimeline {
         let rack_cap = (studio.rack_slots_per_tier_default * 2).max(max_slot + 1);
         let slots = studio.rack_slots(rack_cap);
 
-        let home = chain.clamp_joints(&chain.comfort_pose);
+        let home = chain.clamp_joints(&PARK_HOME_JOINTS);
         let mut q_curr = home;
         let mut gripper_open: f32 = 1.0;
         let mut held_can_slot: Option<usize> = None;
@@ -1235,5 +1238,22 @@ mod tests {
         assert!(saw_held_slot_2, "Never picked up can slot 2");
         assert!(saw_closed_gripper, "Gripper never closed");
         assert!(saw_spray_on, "Spray never activated during PaintStroke");
+    }
+
+    #[test]
+    fn park_home_pose_clears_wall_canvas_for_unobstructed_view() {
+        let studio = StudioConfig::default();
+        let chain = KinematicChain::default_spraybot(&studio);
+        let timeline = CompiledTimeline::empty();
+        let home = timeline.home_joints();
+        assert!(chain.within_limits(&home, 1e-6));
+        assert!(home[0] > studio.canvas_width as f64 * 0.5);
+        for (idx, link) in chain.fk_links(&home).iter().enumerate() {
+            assert!(
+                link.pos.x > studio.canvas_width * 0.5,
+                "home link {idx} at x={:.3} overlaps canvas right edge +1.25m",
+                link.pos.x
+            );
+        }
     }
 }

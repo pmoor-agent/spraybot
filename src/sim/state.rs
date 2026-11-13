@@ -62,7 +62,7 @@ impl Default for SimClock {
             hold_secs: 2.0,
             hold_elapsed: 0.0,
             finished: false,
-            warmup_frames_remaining: 3,
+            warmup_frames_remaining: 6,
         }
     }
 }

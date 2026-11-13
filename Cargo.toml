@@ -26,6 +26,9 @@ bevy = { version = "0.20.1", default-features = false, features = [
     "tonemapping_luts",
     "smaa_luts",
     "zstd_rust",
+    "ui_bevy_render",
+    "bevy_text",
+    "default_font",
 ] }
 # Enable runtime dlopen for libwayland-* so wayland-devel (.pc files) is not required at build time
 wayland-backend = { version = "0.3", features = ["dlopen"] }

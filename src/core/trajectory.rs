@@ -3,7 +3,9 @@ use std::f64::consts::PI;
 use glam::Vec3;
 
 use crate::core::kinematics::{IkMode, KinematicChain};
-use crate::core::types::{JobOp, JobPlan, RobotFrameState, StrokeWaypoint, StudioConfig};
+use crate::core::types::{
+    JobOp, JobPlan, NozzleCap, RobotFrameState, StrokeWaypoint, StudioConfig,
+};
 
 /// Safe Z standoff from the canvas plane (`Z = 0.0`) during rapid air transits (meters).
 const SAFE_TRANSIT_Z: f32 = 0.30;
@@ -596,6 +598,8 @@ impl CompiledTimeline {
                     q_curr = q_at_approach;
                 }
 
+                JobOp::SwapCap { .. } => {}
+
                 JobOp::ParkHome => {
                     push_joint_move(
                         &mut segments,
@@ -631,6 +635,7 @@ impl CompiledTimeline {
                 nozzle_world_dir,
                 spray_active: false,
                 flow_scale: 0.0,
+                active_cap: NozzleCap::Fat,
             };
         }
 
@@ -736,6 +741,7 @@ impl CompiledTimeline {
             nozzle_world_dir,
             spray_active,
             flow_scale,
+            active_cap: NozzleCap::Fat,
         }
     }
 }
@@ -1123,6 +1129,7 @@ mod tests {
                 feed_speed: 0.40,
                 valve_on: false,
                 opacity_scale: 1.0,
+                cap: NozzleCap::Fat,
             },
             StrokeWaypoint {
                 pos: Vec3::new(-0.40, 1.55, 0.0),
@@ -1131,6 +1138,7 @@ mod tests {
                 feed_speed: 0.40,
                 valve_on: true,
                 opacity_scale: 0.9,
+                cap: NozzleCap::Fat,
             },
             StrokeWaypoint {
                 pos: Vec3::new(0.40, 1.55, 0.0),
@@ -1139,6 +1147,7 @@ mod tests {
                 feed_speed: 0.40,
                 valve_on: true,
                 opacity_scale: 0.9,
+                cap: NozzleCap::Fat,
             },
             StrokeWaypoint {
                 pos: Vec3::new(0.435, 1.55, 0.0),
@@ -1147,6 +1156,7 @@ mod tests {
                 feed_speed: 0.40,
                 valve_on: false,
                 opacity_scale: 1.0,
+                cap: NozzleCap::Fat,
             },
         ];
 

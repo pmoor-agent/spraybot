@@ -455,6 +455,7 @@ fn push_primitive(
         color_srgb,
         opacity,
         geometry,
+        gradient_meta: None,
     });
 }
 

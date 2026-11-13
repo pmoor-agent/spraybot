@@ -11,6 +11,61 @@ pub enum PrimitiveGeom {
     StrokedPath { points: Vec<DVec2>, width: f64 },
 }
 
+/// Aerosol spray nozzle cap profile controlling fan angle and flow rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum NozzleCap {
+    #[default]
+    Fat,
+    Skinny,
+}
+
+impl NozzleCap {
+    /// Spray cone half-angle in radians.
+    #[inline]
+    pub fn cone_half_angle_rad(self) -> f32 {
+        match self {
+            Self::Fat => 12.0_f32.to_radians(),
+            Self::Skinny => 2.6_f32.to_radians(),
+        }
+    }
+
+    /// Relative paint flow factor through the cap orifice.
+    #[inline]
+    pub fn orifice_flow_factor(self) -> f32 {
+        match self {
+            Self::Fat => 1.0,
+            Self::Skinny => 0.065,
+        }
+    }
+
+    /// Human-readable display label for HUD/logging.
+    #[inline]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fat => "Fat Cap (12°)",
+            Self::Skinny => "Skinny Cap (2.6°)",
+        }
+    }
+}
+
+/// Optional metadata describing soft gradient fade parameters for decomposed gradient bands.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GradientFillMeta {
+    Linear {
+        origin: DVec2,
+        dir: DVec2,
+        band_width: f64,
+        fade_in_s: Option<(f64, f64)>,
+        fade_out_s: Option<(f64, f64)>,
+    },
+    Radial {
+        center: DVec2,
+        band_width: f64,
+        fade_in_r: Option<(f64, f64)>,
+        fade_out_r: Option<(f64, f64)>,
+    },
+}
+
 /// Single drawable SVG element in painter's back-to-front Z-order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NormalizedPrimitive {
@@ -18,6 +73,7 @@ pub struct NormalizedPrimitive {
     pub color_srgb: [u8; 3],
     pub opacity: f32,
     pub geometry: PrimitiveGeom,
+    pub gradient_meta: Option<GradientFillMeta>,
 }
 
 /// Physical aerosol spray can assigned to a rack slot.
@@ -51,6 +107,8 @@ pub struct StrokeWaypoint {
     pub valve_on: bool,
     /// Flow/opacity multiplier in `(0.0, 1.0]`.
     pub opacity_scale: f32,
+    /// Active nozzle cap profile for this waypoint.
+    pub cap: NozzleCap,
 }
 
 impl StrokeWaypoint {
@@ -72,6 +130,7 @@ impl StrokeWaypoint {
 pub enum JobOp {
     PickCan { slot: usize },
     ShakeCan,
+    SwapCap { cap: NozzleCap },
     PaintStroke { points_canvas_3d: Vec<StrokeWaypoint> },
     ReturnCan { slot: usize },
     ParkHome,
@@ -102,6 +161,8 @@ pub struct RobotFrameState {
     pub spray_active: bool,
     /// Instantaneous flow/opacity multiplier in `[0.0, 1.0]`.
     pub flow_scale: f32,
+    /// Currently mounted nozzle cap profile.
+    pub active_cap: NozzleCap,
 }
 
 impl Default for RobotFrameState {
@@ -115,6 +176,7 @@ impl Default for RobotFrameState {
             nozzle_world_dir: Vec3::NEG_Z,
             spray_active: false,
             flow_scale: 0.0,
+            active_cap: NozzleCap::Fat,
         }
     }
 }
@@ -145,6 +207,15 @@ pub struct RackSlotPose {
     pub grasp_rot: Quat,
     /// Unit vector pointing outward from the rack front toward the robot (`n_rack`).
     /// Safe pre-grasp approach pose lies at `grasp_pos + approach_dir * clearance`.
+    pub approach_dir: Vec3,
+}
+
+/// Target grasp pose for a nozzle cap dock on the rack-mounted cap station.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CapDockPose {
+    pub cap: NozzleCap,
+    pub grasp_pos: Vec3,
+    pub grasp_rot: Quat,
     pub approach_dir: Vec3,
 }
 
@@ -277,6 +348,36 @@ impl StudioConfig {
         slots
     }
 
+    /// Returns the `[Fat, Skinny]` dock poses on the rack-mounted cap swap station.
+    ///
+    /// Mounted on the right (`+t_rack`, robot-facing inner side) upright of the 20°-yawed rack.
+    pub fn cap_station_poses(&self, max_cans: usize) -> [CapDockPose; 2] {
+        let (t_rack, n_rack) = self.rack_axes();
+        let upper_count = max_cans.div_ceil(2);
+        let lower_count = max_cans - upper_count;
+        let tier_slots = upper_count.max(lower_count).max(1);
+        let rack_half_w = (tier_slots as f32 * self.rack_slot_spacing + 0.070) * 0.5;
+        let grasp_rot = Quat::from_rotation_y(self.rack_yaw_deg.to_radians());
+        let station_base = Vec3::new(self.rack_center_xz.x, 1.06, self.rack_center_xz.z)
+            + t_rack * (rack_half_w + 0.078)
+            + n_rack * 0.06;
+
+        [
+            CapDockPose {
+                cap: NozzleCap::Fat,
+                grasp_pos: station_base + t_rack * 0.035,
+                grasp_rot,
+                approach_dir: n_rack,
+            },
+            CapDockPose {
+                cap: NozzleCap::Skinny,
+                grasp_pos: station_base + t_rack * 0.115,
+                grasp_rot,
+                approach_dir: n_rack,
+            },
+        ]
+    }
+
     /// Validates that studio dimensions and limits are physically consistent.
     pub fn is_valid(&self) -> bool {
         self.canvas_width > 0.0
@@ -320,6 +421,7 @@ mod tests {
             feed_speed: 0.35,
             valve_on: true,
             opacity_scale: 0.8,
+            cap: NozzleCap::Fat,
         };
         assert_relative_eq!(wp.nozzle_pos().x, 0.5, epsilon = 1e-6);
         assert_relative_eq!(wp.nozzle_pos().y, 1.5, epsilon = 1e-6);
@@ -327,6 +429,86 @@ mod tests {
         assert_relative_eq!(wp.spray_dir().x, 0.0, epsilon = 1e-6);
         assert_relative_eq!(wp.spray_dir().y, 0.0, epsilon = 1e-6);
         assert_relative_eq!(wp.spray_dir().z, -1.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn nozzle_cap_properties_and_default() {
+        assert_eq!(NozzleCap::default(), NozzleCap::Fat);
+        assert_relative_eq!(
+            NozzleCap::Fat.cone_half_angle_rad(),
+            12.0_f32.to_radians(),
+            epsilon = 1e-6
+        );
+        assert_relative_eq!(
+            NozzleCap::Skinny.cone_half_angle_rad(),
+            2.6_f32.to_radians(),
+            epsilon = 1e-6
+        );
+        assert_relative_eq!(NozzleCap::Fat.orifice_flow_factor(), 1.0, epsilon = 1e-6);
+        assert_relative_eq!(NozzleCap::Skinny.orifice_flow_factor(), 0.065, epsilon = 1e-6);
+        assert_eq!(NozzleCap::Fat.label(), "Fat Cap (12°)");
+        assert_eq!(NozzleCap::Skinny.label(), "Skinny Cap (2.6°)");
+    }
+
+    #[test]
+    fn cap_station_poses_16_geometry_clearance_and_reachability() {
+        let cfg = StudioConfig::default();
+        let (t_rack, n_rack) = cfg.rack_axes();
+        let docks = cfg.cap_station_poses(16);
+        let slots = cfg.rack_slots(16);
+
+        assert_eq!(docks[0].cap, NozzleCap::Fat);
+        assert_eq!(docks[1].cap, NozzleCap::Skinny);
+
+        let shoulder_at_min_q0 = Vec3::new(cfg.rail_q0_min, cfg.shoulder_pivot_y, cfg.rail_z);
+        let max_arm_reach = cfg.upper_arm_l2 + cfg.forearm_l3;
+
+        // Rightmost can slots are slot 7 (upper tier) and slot 15 (lower tier).
+        let rightmost_upper = slots[7].grasp_pos;
+        let rightmost_lower = slots[15].grasp_pos;
+
+        for dock in &docks {
+            assert!(
+                dock.grasp_pos.x < -1.30,
+                "cap dock {:?} X={:.3} must be < -1.30",
+                dock.cap,
+                dock.grasp_pos.x
+            );
+            assert_relative_eq!(dock.approach_dir.x, n_rack.x, epsilon = 1e-6);
+            assert_relative_eq!(dock.approach_dir.y, n_rack.y, epsilon = 1e-6);
+            assert_relative_eq!(dock.approach_dir.z, n_rack.z, epsilon = 1e-6);
+
+            let local_x = dock.grasp_rot * Vec3::X;
+            let local_y = dock.grasp_rot * Vec3::Y;
+            let local_z = dock.grasp_rot * Vec3::Z;
+            assert_relative_eq!(local_x.dot(t_rack), 1.0, epsilon = 1e-5);
+            assert_relative_eq!(local_y.dot(Vec3::Y), 1.0, epsilon = 1e-5);
+            assert_relative_eq!(local_z.dot(n_rack), 1.0, epsilon = 1e-5);
+
+            // Clear of rightmost can slot by >= 0.08m (both along t_rack and in 3D).
+            let t_clear_upper = (dock.grasp_pos - rightmost_upper).dot(t_rack);
+            let t_clear_lower = (dock.grasp_pos - rightmost_lower).dot(t_rack);
+            assert!(
+                t_clear_upper >= 0.08 && t_clear_lower >= 0.08,
+                "cap dock {:?} too close along t_rack: upper={t_clear_upper:.3}, lower={t_clear_lower:.3}",
+                dock.cap
+            );
+            assert!(dock.grasp_pos.distance(rightmost_upper) >= 0.08);
+            assert!(dock.grasp_pos.distance(rightmost_lower) >= 0.08);
+
+            // Well within arm reach from q0 = -1.75
+            let dist = dock.grasp_pos.distance(shoulder_at_min_q0);
+            assert!(
+                dist < max_arm_reach - 0.25,
+                "cap dock {:?} distance {dist:.3}m not comfortably within L2+L3={max_arm_reach:.3}m",
+                dock.cap
+            );
+        }
+
+        // Skinny dock is 0.08m further +t_rack than Fat dock
+        let delta = docks[1].grasp_pos - docks[0].grasp_pos;
+        assert_relative_eq!(delta.length(), 0.08, epsilon = 1e-5);
+        assert_relative_eq!(delta.normalize().dot(t_rack), 1.0, epsilon = 1e-5);
     }
 
     #[test]

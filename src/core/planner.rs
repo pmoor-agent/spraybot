@@ -11,7 +11,7 @@ use glam::{DVec2, Vec3};
 
 use crate::core::batching::ColorBatch;
 use crate::core::types::{
-    JobOp, JobPlan, NormalizedPrimitive, PalettePlan, PrimitiveGeom, StrokeWaypoint,
+    JobOp, JobPlan, NormalizedPrimitive, NozzleCap, PalettePlan, PrimitiveGeom, StrokeWaypoint,
 };
 
 /// Minimum polygon area (m^2) below which degenerate slivers are skipped.
@@ -491,6 +491,7 @@ fn emit_polyline_stroke(
         feed_speed,
         valve_on,
         opacity_scale: opacity,
+        cap: NozzleCap::Fat,
     };
 
     let mut waypoints = Vec::with_capacity(pts.len() + 2);
@@ -535,6 +536,7 @@ mod tests {
             color_srgb: [255, 100, 50],
             opacity: 1.0,
             geometry: PrimitiveGeom::FilledPolygon(square_poly(0.0, 1.55, 0.20)),
+            gradient_meta: None,
         }];
         let palette = quantize_palette(&prims, 16, 42);
         let batches = batch_primitives(&prims, &palette, &BatchConfig::default());
@@ -584,6 +586,7 @@ mod tests {
             color_srgb: [255, 255, 255],
             opacity: 1.0,
             geometry: PrimitiveGeom::FilledPolygon(MultiPolygon::new(vec![poly])),
+            gradient_meta: None,
         }];
         let palette = quantize_palette(&prims, 16, 42);
         let batches = batch_primitives(&prims, &palette, &BatchConfig::default());
@@ -688,6 +691,7 @@ mod tests {
                 points: vec![DVec2::new(-0.5, 1.5), DVec2::new(0.5, 1.5)],
                 width: 0.16,
             },
+            gradient_meta: None,
         }];
         let palette = quantize_palette(&prims, 16, 42);
         let batches = batch_primitives(&prims, &palette, &BatchConfig::default());
@@ -732,6 +736,7 @@ mod tests {
             color_srgb: [94, 43, 255],
             opacity: 1.0,
             geometry: PrimitiveGeom::FilledPolygon(MultiPolygon::new(vec![poly])),
+            gradient_meta: None,
         }];
         let palette = quantize_palette(&prims, 16, 42);
         let batches = batch_primitives(&prims, &palette, &BatchConfig::default());

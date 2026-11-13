@@ -312,6 +312,7 @@ mod tests {
             color_srgb: color,
             opacity: 1.0,
             geometry: PrimitiveGeom::FilledPolygon(MultiPolygon::new(vec![poly])),
+            gradient_meta: None,
         }
     }
 

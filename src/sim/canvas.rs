@@ -558,19 +558,18 @@ fn build_linen_weave_normal_map(width: u32, height: u32) -> Image {
     let h = height.max(1);
     let mut data = vec![0_u8; (w as usize) * (h as usize) * 4];
 
-    // ~2.5mm linen thread pitch across 2.50m x 1.50m canvas -> ~1000 x 600 cycles?
-    // At 1024x614 texels, ~256 warp/weft cycles gives ~4 texels per thread (clean, zero aliasing).
-    let cycles_x = 256.0_f32;
-    let cycles_y = 154.0_f32;
-    let bump_strength = 0.22_f32;
+    // Smooth orthogonal linen cross-weave kept well below Nyquist at 360p/720p/1080p
+    // to avoid diagonal moiré aliasing while preserving subtle tactile gesso relief.
+    let cycles_x = 80.0_f32;
+    let cycles_y = 48.0_f32;
+    let bump_strength = 0.052_f32;
 
     let weave_height = |u: f32, v: f32| -> f32 {
         let px = u * cycles_x * 2.0 * PI;
         let py = v * cycles_y * 2.0 * PI;
-        let warp = px.sin() * (0.5 + 0.5 * (py * 0.5).cos());
-        let weft = py.sin() * (0.5 + 0.5 * (px * 0.5).sin());
-        let micro = ((px * 2.0 + py).sin() * 0.12) + ((px - py * 2.0).cos() * 0.12);
-        0.5 * (warp + weft) + micro
+        let warp = px.sin() * (0.75 + 0.25 * py.cos());
+        let weft = py.sin() * (0.75 + 0.25 * px.cos());
+        0.5 * (warp + weft)
     };
 
     let du = 1.0 / w as f32;

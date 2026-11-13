@@ -39,6 +39,18 @@ fn step_clock(clock: &mut SimClock, dt_wall: f64) {
     }
 }
 
+const MAX_LIVE_DT_WALL: f64 = 0.05;
+
+/// Clamps live wall-clock frame delta so slow frames cannot trigger a `dt_sim` spiral.
+#[inline]
+pub fn effective_live_dt_wall(raw_dt: f64) -> f64 {
+    if raw_dt.is_finite() {
+        raw_dt.clamp(0.0, MAX_LIVE_DT_WALL)
+    } else {
+        0.0
+    }
+}
+
 fn advance_sim_clock(
     app_config: Res<AppConfig>,
     time: Res<Time>,
@@ -47,7 +59,7 @@ fn advance_sim_clock(
     let dt_wall = if app_config.cli.record.is_some() {
         1.0 / (app_config.cli.fps.max(1) as f64)
     } else {
-        time.delta_secs_f64()
+        effective_live_dt_wall(time.delta_secs_f64())
     };
     step_clock(&mut clock, dt_wall);
 }
@@ -176,5 +188,27 @@ mod tests {
         step_clock(&mut clock, 0.1);
         assert_eq!(clock.t_sim, 0.0);
         assert!(!clock.finished);
+    }
+
+    #[test]
+    fn live_dt_wall_clamps_slow_frames() {
+        assert!((effective_live_dt_wall(1.0 / 60.0) - (1.0 / 60.0)).abs() < 1e-12);
+        assert!((effective_live_dt_wall(0.05) - 0.05).abs() < 1e-12);
+        assert!((effective_live_dt_wall(0.25) - 0.05).abs() < 1e-12);
+        assert!((effective_live_dt_wall(2.0) - 0.05).abs() < 1e-12);
+        assert_eq!(effective_live_dt_wall(0.0), 0.0);
+        assert_eq!(effective_live_dt_wall(-0.05), 0.0);
+        assert_eq!(effective_live_dt_wall(f64::NAN), 0.0);
+        assert_eq!(effective_live_dt_wall(f64::INFINITY), 0.0);
+
+        // Verify high --speed with a slow-frame raw_dt is bounded by 0.05 * speed
+        let mut clock = SimClock {
+            total_duration: 100.0,
+            speed: 32.0,
+            warmup_frames_remaining: 0,
+            ..Default::default()
+        };
+        step_clock(&mut clock, effective_live_dt_wall(0.5));
+        assert!((clock.t_sim - 1.6).abs() < 1e-12);
     }
 }

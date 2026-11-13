@@ -1,12 +1,15 @@
 use std::f32::consts::PI;
+use std::thread::{self, JoinHandle};
 
 use bevy::asset::RenderAssetUsages;
 use bevy::image::ImageSampler;
 use bevy::mesh::Indices;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use crossbeam_channel::{Receiver, Sender};
 
-use crate::core::types::NozzleCap;
+use crate::core::trajectory::CompiledTimeline;
+use crate::core::types::{NozzleCap, PalettePlan, RobotFrameState};
 use crate::sim::state::{AppConfig, SimClock, SimStepSet, SprayJobRes};
 
 /// Spray cone half-angle (12 degrees).
@@ -25,11 +28,23 @@ const SPRAY_FLOW_RATE: f32 = 0.075;
 /// Thickness increment factor per Beer-Lambert step so 1-2 passes transition to satin acrylic.
 const THICKNESS_ACCUM_SCALE: f32 = 0.38;
 
-/// Coarse time step (seconds) for skipping non-spraying intervals while catching short strokes.
-const ADAPTIVE_COARSE_DT: f64 = 0.003;
+/// Base adaptive time step (seconds) for swept-segment timeline deposition.
+const SWEPT_STEP_DT: f64 = 0.008;
 
-/// Maximum sub-steps per coarse interval to bound work on extreme edge cases.
-const MAX_SUBSTEPS_PER_COARSE: usize = 160;
+/// Maximum segment nozzle displacement (meters) before subdividing a swept interval.
+const MAX_SWEPT_DISPLACEMENT_M: f32 = 0.04;
+
+/// Minimum nozzle direction dot product before subdividing a sharply turning swept interval.
+const MIN_SWEPT_DIR_COS: f32 = 0.995;
+
+/// Maximum midpoint chord sagitta (meters) before subdividing a curved swept interval.
+const MAX_SWEPT_SAGITTA_M: f32 = 0.002;
+
+/// Maximum recursion depth for subdividing fast or curved swept intervals.
+const MAX_DEPOSIT_SUBDIV_DEPTH: u8 = 4;
+
+/// Recursion depth for spray start/stop and cap/slot transition intervals.
+const TRANSITION_SUBDIV_DEPTH: u8 = 3;
 
 /// Registers the dynamic PBR wall canvas and ray-plane spray deposition systems.
 pub fn plugin(app: &mut App) {
@@ -44,8 +59,11 @@ struct WallCanvasMesh;
 struct CanvasResources {
     albedo_tex: Handle<Image>,
     metallic_roughness_tex: Handle<Image>,
-    buffer: CanvasPaintBuffer,
+    tex_width: u32,
+    tex_height: u32,
+    worker: CanvasPaintWorker,
     last_reset_epoch: u64,
+    last_dispatched_t_sim: f64,
 }
 
 /// CPU backing buffers for linear-RGB spray blending and paint thickness accumulation.
@@ -185,50 +203,27 @@ impl CanvasPaintBuffer {
         let cos_phi = (-dir.z).clamp(0.25, 1.0);
         let max_extent = 1.45 * spot_radius / cos_phi;
 
-        let min_x_world = hit.x - max_extent;
-        let max_x_world = hit.x + max_extent;
-        let min_y_world = hit.y - max_extent;
-        let max_y_world = hit.y + max_extent;
-
-        let canvas_left = self.canvas_center.x - 0.5 * self.canvas_width;
-        let canvas_right = self.canvas_center.x + 0.5 * self.canvas_width;
-        let canvas_bottom = self.canvas_center.y - 0.5 * self.canvas_height;
-        let canvas_top = self.canvas_center.y + 0.5 * self.canvas_height;
-
-        if max_x_world < canvas_left
-            || min_x_world > canvas_right
-            || max_y_world < canvas_bottom
-            || min_y_world > canvas_top
-        {
-            return None;
-        }
-
-        let u_min = ((min_x_world - canvas_left) / self.canvas_width).clamp(0.0, 1.0);
-        let u_max = ((max_x_world - canvas_left) / self.canvas_width).clamp(0.0, 1.0);
-        // Note: world top (+Y) is v = 0, world bottom (-Y) is v = 1.
-        let v_min = ((canvas_top - max_y_world) / self.canvas_height).clamp(0.0, 1.0);
-        let v_max = ((canvas_top - min_y_world) / self.canvas_height).clamp(0.0, 1.0);
-
-        let px_min = ((u_min * self.width as f32).floor() as i32).clamp(0, self.width as i32 - 1) as u32;
-        let px_max = ((u_max * self.width as f32).ceil() as i32).clamp(0, self.width as i32 - 1) as u32;
-        let py_min = ((v_min * self.height as f32).floor() as i32).clamp(0, self.height as i32 - 1) as u32;
-        let py_max = ((v_max * self.height as f32).ceil() as i32).clamp(0, self.height as i32 - 1) as u32;
-
-        if px_min > px_max || py_min > py_max {
-            return None;
-        }
+        let (px_min, py_min, px_max, py_max) = self.world_bounds_to_pixels(
+            hit.x - max_extent,
+            hit.x + max_extent,
+            hit.y - max_extent,
+            hit.y + max_extent,
+        )?;
 
         // Scale area by 1 / cos(phi) to conserve paint mass across oblique incidence ellipses.
         let plume_area = (PI * spot_radius * spot_radius / cos_phi).max(1e-6);
         let dose_coeff =
             SPRAY_FLOW_RATE * cap.orifice_flow_factor() * flow_scale * dt_sub / plume_area;
 
+        let canvas_left = self.canvas_center.x - 0.5 * self.canvas_width;
+        let canvas_top = self.canvas_center.y + 0.5 * self.canvas_height;
+        let w = self.width as usize;
+
         let mut dirty_x0 = u32::MAX;
         let mut dirty_y0 = u32::MAX;
         let mut dirty_x1 = 0_u32;
         let mut dirty_y1 = 0_u32;
 
-        let w = self.width as usize;
         for py in py_min..=py_max {
             let v_coord = (py as f32 + 0.5) / self.height as f32;
             let wy = canvas_top - v_coord * self.canvas_height;
@@ -253,18 +248,7 @@ impl CanvasPaintBuffer {
 
                 let u_cone = u_cone_sq.sqrt();
                 let gaussian = (-2.2 * u_cone_sq).exp();
-                let falloff = if u_cone <= 0.75 {
-                    gaussian
-                } else {
-                    let rim_t = ((u_cone - 0.75) / 0.60).clamp(0.0, 1.0);
-                    let h = spatial_hash_01(px, py, self.seed);
-                    let droplet_prob = (1.0 - rim_t).powf(1.2) * 0.90 + 0.05;
-                    if h < droplet_prob {
-                        gaussian * (0.70 + 0.60 * (1.0 - h))
-                    } else {
-                        gaussian * 0.08 * (1.0 - rim_t)
-                    }
-                };
+                let falloff = apply_rim_modulation(px, py, self.seed, u_cone, gaussian);
 
                 let alpha_step = 1.0 - (-dose_coeff * falloff).exp();
                 if alpha_step <= 1e-5 {
@@ -272,13 +256,7 @@ impl CanvasPaintBuffer {
                 }
 
                 let idx = row_offset + (px as usize);
-                let dst = &mut self.linear_rgb[idx];
-                let inv = 1.0 - alpha_step;
-                dst[0] = dst[0] * inv + paint_linear[0] * alpha_step;
-                dst[1] = dst[1] * inv + paint_linear[1] * alpha_step;
-                dst[2] = dst[2] * inv + paint_linear[2] * alpha_step;
-                self.thickness[idx] =
-                    (self.thickness[idx] + alpha_step * THICKNESS_ACCUM_SCALE).min(1.5);
+                self.deposit_texel(idx, paint_linear, alpha_step, alpha_step);
 
                 dirty_x0 = dirty_x0.min(px);
                 dirty_y0 = dirty_y0.min(py);
@@ -291,6 +269,420 @@ impl CanvasPaintBuffer {
             Some((dirty_x0, dirty_y0, dirty_x1, dirty_y1))
         } else {
             None
+        }
+    }
+
+    /// Deposits a continuous swept spray interval `(pos0, dir0) -> (pos1, dir1)` over `dt` seconds
+    /// using an analytical Gaussian swept-chord integral on a single bounding-box pass.
+    ///
+    /// Falls back to [`Self::splat_cone_with_cap`] when ray-plane displacement is below `0.25 * avg_r`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn splat_swept_segment_with_cap(
+        &mut self,
+        pos0: Vec3,
+        dir0: Vec3,
+        pos1: Vec3,
+        dir1: Vec3,
+        paint_linear: [f32; 3],
+        flow_scale: f32,
+        dt: f32,
+        cap: NozzleCap,
+    ) -> Option<(u32, u32, u32, u32)> {
+        if flow_scale <= 0.0 || dt <= 0.0 {
+            return None;
+        }
+
+        let d0 = dir0.normalize_or_zero();
+        let d1 = dir1.normalize_or_zero();
+        let z_plane = self.canvas_center.z;
+
+        let t0 = if d0.length_squared() >= 0.5 && d0.z < -1e-4 {
+            (z_plane - pos0.z) / d0.z
+        } else {
+            -1.0
+        };
+        let t1 = if d1.length_squared() >= 0.5 && d1.z < -1e-4 {
+            (z_plane - pos1.z) / d1.z
+        } else {
+            -1.0
+        };
+        let t0_valid = (0.002..=1.2).contains(&t0);
+        let t1_valid = (0.002..=1.2).contains(&t1);
+
+        match (t0_valid, t1_valid) {
+            (false, false) => return None,
+            (true, false) => {
+                return self.splat_cone_with_cap(pos0, d0, paint_linear, flow_scale, dt * 0.5, cap);
+            }
+            (false, true) => {
+                return self.splat_cone_with_cap(pos1, d1, paint_linear, flow_scale, dt * 0.5, cap);
+            }
+            (true, true) => {}
+        }
+
+        let h0 = pos0 + d0 * t0;
+        let h1 = pos1 + d1 * t1;
+        let tan_half = cap.cone_half_angle_rad().tan();
+        let r0 = (t0 * tan_half).max(1e-4);
+        let r1 = (t1 * tan_half).max(1e-4);
+        let avg_r = 0.5 * (r0 + r1);
+
+        let seg_xy = Vec2::new(h1.x - h0.x, h1.y - h0.y);
+        let seg_len = seg_xy.length();
+        let dir_mid = (d0 + d1).normalize_or(d0);
+        if seg_len < 0.25 * avg_r {
+            let pos_mid = 0.5 * (pos0 + pos1);
+            return self.splat_cone_with_cap(pos_mid, dir_mid, paint_linear, flow_scale, dt, cap);
+        }
+
+        let cos_phi = (-dir_mid.z).clamp(0.25, 1.0);
+        let min_cos = ((-d0.z).clamp(0.25, 1.0))
+            .min((-d1.z).clamp(0.25, 1.0))
+            .min(cos_phi);
+        let ext = 1.45 * r0.max(r1) / min_cos;
+
+        let (px_min, py_min, px_max, py_max) = self.world_bounds_to_pixels(
+            h0.x.min(h1.x) - ext,
+            h0.x.max(h1.x) + ext,
+            h0.y.min(h1.y) - ext,
+            h0.y.max(h1.y) + ext,
+        )?;
+
+        // Project onto the plane perpendicular to dir_mid so oblique incidence stretches cleanly.
+        let dir_xy = Vec2::new(dir_mid.x, dir_mid.y);
+        let seg_m = Vec3::new(seg_xy.x, seg_xy.y, 0.0) - dir_mid * seg_xy.dot(dir_xy);
+        let seg_m_len = seg_m.length();
+        if seg_m_len < 1e-6 {
+            let pos_mid = 0.5 * (pos0 + pos1);
+            return self.splat_cone_with_cap(pos_mid, dir_mid, paint_linear, flow_scale, dt, cap);
+        }
+
+        let seg_m_dir = seg_m / seg_m_len;
+        let inv_seg_m_len = 1.0 / seg_m_len;
+        let r = avg_r;
+        let inv_r_sq = 1.0 / (r * r);
+        let l_over_r = seg_m_len / r;
+        let r_over_l = r / seg_m_len;
+        let k_erf = 2.2_f32.sqrt() * l_over_r;
+        let prefactor = r_over_l * (PI / 8.8_f32).sqrt();
+
+        // Scale area by 1 / cos(phi) to conserve paint mass across oblique incidence ellipses.
+        let plume_area = (PI * r * r / cos_phi).max(1e-6);
+        let dose_coeff =
+            SPRAY_FLOW_RATE * cap.orifice_flow_factor() * flow_scale * dt / plume_area;
+
+        let canvas_left = self.canvas_center.x - 0.5 * self.canvas_width;
+        let canvas_top = self.canvas_center.y + 0.5 * self.canvas_height;
+        let w = self.width as usize;
+
+        let mut dirty_x0 = u32::MAX;
+        let mut dirty_y0 = u32::MAX;
+        let mut dirty_x1 = 0_u32;
+        let mut dirty_y1 = 0_u32;
+
+        for py in py_min..=py_max {
+            let v_coord = (py as f32 + 0.5) / self.height as f32;
+            let wy = canvas_top - v_coord * self.canvas_height;
+            let row_offset = (py as usize) * w;
+
+            for px in px_min..=px_max {
+                let u_coord = (px as f32 + 0.5) / self.width as f32;
+                let wx = canvas_left + u_coord * self.canvas_width;
+
+                let d_xy = Vec2::new(wx - h0.x, wy - h0.y);
+                let d_m = Vec3::new(d_xy.x, d_xy.y, 0.0) - dir_mid * d_xy.dot(dir_xy);
+                let along_m = d_m.dot(seg_m_dir);
+                let s = along_m * inv_seg_m_len;
+                let perp_m_sq = (d_m - seg_m_dir * along_m).length_squared().max(0.0);
+                let u_perp_sq = perp_m_sq * inv_r_sq;
+                if u_perp_sq > 1.35 * 1.35 {
+                    continue;
+                }
+
+                let s_clamped = s.clamp(0.0, 1.0);
+                let axial_gap = l_over_r * (s - s_clamped);
+                let u_min_sq = u_perp_sq + axial_gap * axial_gap;
+                if u_min_sq > 1.35 * 1.35 {
+                    continue;
+                }
+
+                let chord_integral =
+                    prefactor * (erf_f32(k_erf * (1.0 - s)) + erf_f32(k_erf * s));
+                let base_falloff = (-2.2 * u_perp_sq).exp() * chord_integral;
+                let u_rim = u_min_sq.sqrt();
+                let falloff = apply_rim_modulation(px, py, self.seed, u_rim, base_falloff);
+
+                let total_dose = dose_coeff * falloff;
+                let alpha_step = 1.0 - (-total_dose).exp();
+                if alpha_step <= 1e-5 {
+                    continue;
+                }
+
+                let idx = row_offset + (px as usize);
+                self.deposit_texel(idx, paint_linear, alpha_step, total_dose);
+
+                dirty_x0 = dirty_x0.min(px);
+                dirty_y0 = dirty_y0.min(py);
+                dirty_x1 = dirty_x1.max(px);
+                dirty_y1 = dirty_y1.max(py);
+            }
+        }
+
+        if dirty_x0 <= dirty_x1 && dirty_y0 <= dirty_y1 {
+            Some((dirty_x0, dirty_y0, dirty_x1, dirty_y1))
+        } else {
+            None
+        }
+    }
+
+    /// Deposits spray paint across timeline interval `[t_from, t_to]` using adaptive swept segments
+    /// (~`0.008s` step), subdividing on sharp turns or high displacement and falling back to point
+    /// splats at spray start/stop transitions.
+    pub fn deposit_timeline_interval(
+        &mut self,
+        timeline: &CompiledTimeline,
+        palette: &PalettePlan,
+        t_from: f64,
+        t_to: f64,
+    ) -> Option<(u32, u32, u32, u32)> {
+        if t_to <= t_from + 1e-9 {
+            return None;
+        }
+
+        let mut dirty: Option<(u32, u32, u32, u32)> = None;
+        let mut t = t_from;
+        let mut s0 = timeline.sample(t);
+
+        while t < t_to - 1e-9 {
+            let dt_step = (t_to - t).min(SWEPT_STEP_DT);
+            let t_next = t + dt_step;
+            let s1 = timeline.sample(t_next);
+
+            if s0.spray_active || s1.spray_active {
+                let rect = self.deposit_sub_interval(timeline, palette, t, t_next, &s0, &s1, 0);
+                dirty = merge_dirty_rect(dirty, rect);
+            }
+
+            t = t_next;
+            s0 = s1;
+        }
+
+        dirty
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn deposit_sub_interval(
+        &mut self,
+        timeline: &CompiledTimeline,
+        palette: &PalettePlan,
+        t0: f64,
+        t1: f64,
+        s0: &RobotFrameState,
+        s1: &RobotFrameState,
+        depth: u8,
+    ) -> Option<(u32, u32, u32, u32)> {
+        let dt = t1 - t0;
+        if dt <= 1e-9 || (!s0.spray_active && !s1.spray_active) {
+            return None;
+        }
+
+        let same_continuous_spray = s0.spray_active
+            && s1.spray_active
+            && s0.held_can_slot.is_some()
+            && s0.held_can_slot == s1.held_can_slot
+            && s0.active_cap == s1.active_cap;
+
+        if same_continuous_spray {
+            let disp = (s1.nozzle_world_pos - s0.nozzle_world_pos).length();
+            let dir_cos = s0
+                .nozzle_world_dir
+                .normalize_or_zero()
+                .dot(s1.nozzle_world_dir.normalize_or_zero());
+            let flow_diff = (s0.flow_scale - s1.flow_scale).abs();
+
+            let mut needs_subdiv = disp > MAX_SWEPT_DISPLACEMENT_M
+                || dir_cos < MIN_SWEPT_DIR_COS
+                || flow_diff > 0.15;
+
+            let t_mid = 0.5 * (t0 + t1);
+            let mut s_mid_opt: Option<RobotFrameState> = None;
+            if !needs_subdiv && depth < MAX_DEPOSIT_SUBDIV_DEPTH {
+                let s_mid = timeline.sample(t_mid);
+                let chord_mid = 0.5 * (s0.nozzle_world_pos + s1.nozzle_world_pos);
+                let sagitta = (s_mid.nozzle_world_pos - chord_mid).length();
+                if sagitta > MAX_SWEPT_SAGITTA_M
+                    || !s_mid.spray_active
+                    || s_mid.held_can_slot != s0.held_can_slot
+                    || s_mid.active_cap != s0.active_cap
+                {
+                    needs_subdiv = true;
+                }
+                s_mid_opt = Some(s_mid);
+            }
+
+            if needs_subdiv && depth < MAX_DEPOSIT_SUBDIV_DEPTH {
+                let s_mid = s_mid_opt.unwrap_or_else(|| timeline.sample(t_mid));
+                let left =
+                    self.deposit_sub_interval(timeline, palette, t0, t_mid, s0, &s_mid, depth + 1);
+                let right =
+                    self.deposit_sub_interval(timeline, palette, t_mid, t1, &s_mid, s1, depth + 1);
+                return merge_dirty_rect(left, right);
+            }
+
+            let slot = s0.held_can_slot?;
+            let can = palette.cans.get(slot)?;
+            let paint_linear = srgb_u8_to_linear_rgb(can.color_srgb);
+            let flow_scale = 0.5 * (s0.flow_scale + s1.flow_scale);
+            return self.splat_swept_segment_with_cap(
+                s0.nozzle_world_pos,
+                s0.nozzle_world_dir,
+                s1.nozzle_world_pos,
+                s1.nozzle_world_dir,
+                paint_linear,
+                flow_scale,
+                dt as f32,
+                s0.active_cap,
+            );
+        }
+
+        // Spray start/stop or cap/slot transition: subdivide and fall back to point splat.
+        let t_mid = 0.5 * (t0 + t1);
+        if depth < TRANSITION_SUBDIV_DEPTH {
+            let s_mid = timeline.sample(t_mid);
+            let left =
+                self.deposit_sub_interval(timeline, palette, t0, t_mid, s0, &s_mid, depth + 1);
+            let right =
+                self.deposit_sub_interval(timeline, palette, t_mid, t1, &s_mid, s1, depth + 1);
+            return merge_dirty_rect(left, right);
+        }
+
+        let frame = timeline.sample(t_mid);
+        if !frame.spray_active {
+            return None;
+        }
+        let slot = frame.held_can_slot?;
+        let can = palette.cans.get(slot)?;
+        let paint_linear = srgb_u8_to_linear_rgb(can.color_srgb);
+        self.splat_cone_with_cap(
+            frame.nozzle_world_pos,
+            frame.nozzle_world_dir,
+            paint_linear,
+            frame.flow_scale,
+            dt as f32,
+            frame.active_cap,
+        )
+    }
+
+    #[inline]
+    fn world_bounds_to_pixels(
+        &self,
+        min_x_world: f32,
+        max_x_world: f32,
+        min_y_world: f32,
+        max_y_world: f32,
+    ) -> Option<(u32, u32, u32, u32)> {
+        let canvas_left = self.canvas_center.x - 0.5 * self.canvas_width;
+        let canvas_right = self.canvas_center.x + 0.5 * self.canvas_width;
+        let canvas_bottom = self.canvas_center.y - 0.5 * self.canvas_height;
+        let canvas_top = self.canvas_center.y + 0.5 * self.canvas_height;
+
+        if max_x_world < canvas_left
+            || min_x_world > canvas_right
+            || max_y_world < canvas_bottom
+            || min_y_world > canvas_top
+        {
+            return None;
+        }
+
+        let u_min = ((min_x_world - canvas_left) / self.canvas_width).clamp(0.0, 1.0);
+        let u_max = ((max_x_world - canvas_left) / self.canvas_width).clamp(0.0, 1.0);
+        // Note: world top (+Y) is v = 0, world bottom (-Y) is v = 1.
+        let v_min = ((canvas_top - max_y_world) / self.canvas_height).clamp(0.0, 1.0);
+        let v_max = ((canvas_top - min_y_world) / self.canvas_height).clamp(0.0, 1.0);
+
+        let px_min =
+            ((u_min * self.width as f32).floor() as i32).clamp(0, self.width as i32 - 1) as u32;
+        let px_max =
+            ((u_max * self.width as f32).ceil() as i32).clamp(0, self.width as i32 - 1) as u32;
+        let py_min =
+            ((v_min * self.height as f32).floor() as i32).clamp(0, self.height as i32 - 1) as u32;
+        let py_max =
+            ((v_max * self.height as f32).ceil() as i32).clamp(0, self.height as i32 - 1) as u32;
+
+        if px_min > px_max || py_min > py_max {
+            None
+        } else {
+            Some((px_min, py_min, px_max, py_max))
+        }
+    }
+
+    #[inline]
+    fn deposit_texel(
+        &mut self,
+        idx: usize,
+        paint_linear: [f32; 3],
+        alpha_step: f32,
+        thickness_dose: f32,
+    ) {
+        let dst = &mut self.linear_rgb[idx];
+        let inv = 1.0 - alpha_step;
+        dst[0] = dst[0] * inv + paint_linear[0] * alpha_step;
+        dst[1] = dst[1] * inv + paint_linear[1] * alpha_step;
+        dst[2] = dst[2] * inv + paint_linear[2] * alpha_step;
+        self.thickness[idx] =
+            (self.thickness[idx] + thickness_dose * THICKNESS_ACCUM_SCALE).min(1.5);
+    }
+
+    /// Encodes a tightly packed `rect_w * rect_h * 4` RGBA8 patch for the dirty bounding box.
+    pub fn encode_dirty_patch(
+        &self,
+        min_x: u32,
+        min_y: u32,
+        max_x: u32,
+        max_y: u32,
+        reset_epoch: u64,
+    ) -> PaintPatch {
+        let x0 = min_x.min(self.width.saturating_sub(1));
+        let x1 = max_x.min(self.width.saturating_sub(1)).max(x0);
+        let y0 = min_y.min(self.height.saturating_sub(1));
+        let y1 = max_y.min(self.height.saturating_sub(1)).max(y0);
+
+        let rect_w = (x1 - x0 + 1) as usize;
+        let rect_h = (y1 - y0 + 1) as usize;
+        let byte_len = rect_w * rect_h * 4;
+        let mut albedo_patch = vec![0_u8; byte_len];
+        let mut mr_patch = vec![0_u8; byte_len];
+        let w = self.width as usize;
+
+        for dy in 0..rect_h {
+            let src_row = (y0 as usize + dy) * w;
+            let dst_row = dy * rect_w;
+            for dx in 0..rect_w {
+                let src_idx = src_row + (x0 as usize + dx);
+                let dst_base = (dst_row + dx) * 4;
+
+                let lin = self.linear_rgb[src_idx];
+                albedo_patch[dst_base] = linear_f32_to_srgb_u8(lin[0]);
+                albedo_patch[dst_base + 1] = linear_f32_to_srgb_u8(lin[1]);
+                albedo_patch[dst_base + 2] = linear_f32_to_srgb_u8(lin[2]);
+                albedo_patch[dst_base + 3] = 255;
+
+                let rough = roughness_from_thickness(self.thickness[src_idx]);
+                mr_patch[dst_base] = 0;
+                mr_patch[dst_base + 1] = (rough * 255.0).round().clamp(0.0, 255.0) as u8;
+                mr_patch[dst_base + 2] = 0;
+                mr_patch[dst_base + 3] = 255;
+            }
+        }
+
+        PaintPatch {
+            reset_epoch,
+            min_x: x0,
+            min_y: y0,
+            max_x: x1,
+            max_y: y1,
+            albedo_patch,
+            mr_patch,
         }
     }
 
@@ -367,6 +759,234 @@ impl CanvasPaintBuffer {
     }
 }
 
+/// Tightly packed RGBA8 dirty-rect patch produced by [`CanvasPaintWorker`].
+#[derive(Debug, Clone)]
+pub struct PaintPatch {
+    pub reset_epoch: u64,
+    pub min_x: u32,
+    pub min_y: u32,
+    pub max_x: u32,
+    pub max_y: u32,
+    pub albedo_patch: Vec<u8>,
+    pub mr_patch: Vec<u8>,
+}
+
+enum PaintCmd {
+    AdvanceTo {
+        t_target: f64,
+        reset_epoch: u64,
+        sync_reply: Option<Sender<()>>,
+    },
+    Shutdown,
+}
+
+/// Persistent background thread owning CPU canvas paint deposition and patch encoding.
+pub struct CanvasPaintWorker {
+    cmd_tx: Sender<PaintCmd>,
+    patch_rx: Receiver<PaintPatch>,
+    join_handle: Option<JoinHandle<()>>,
+}
+
+impl CanvasPaintWorker {
+    /// Spawns the dedicated background paint worker thread.
+    pub fn new(
+        buffer: CanvasPaintBuffer,
+        timeline: CompiledTimeline,
+        palette: PalettePlan,
+        initial_reset_epoch: u64,
+    ) -> Self {
+        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<PaintCmd>();
+        let (patch_tx, patch_rx) = crossbeam_channel::unbounded::<PaintPatch>();
+
+        let join_handle = thread::Builder::new()
+            .name("canvas-paint-worker".to_string())
+            .spawn(move || {
+                run_paint_worker(
+                    buffer,
+                    timeline,
+                    palette,
+                    initial_reset_epoch,
+                    cmd_rx,
+                    patch_tx,
+                );
+            })
+            .expect("failed to spawn canvas-paint-worker thread");
+
+        Self {
+            cmd_tx,
+            patch_rx,
+            join_handle: Some(join_handle),
+        }
+    }
+
+    /// Queues a non-blocking advance request for live playback.
+    pub fn advance_async(&self, t_target: f64, reset_epoch: u64) {
+        let _ = self.cmd_tx.send(PaintCmd::AdvanceTo {
+            t_target,
+            reset_epoch,
+            sync_reply: None,
+        });
+    }
+
+    /// Advances synchronously until the worker finishes `[worker_t, t_target]` and queues any patch.
+    pub fn advance_sync(&self, t_target: f64, reset_epoch: u64) {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded::<()>(1);
+        if self
+            .cmd_tx
+            .send(PaintCmd::AdvanceTo {
+                t_target,
+                reset_epoch,
+                sync_reply: Some(reply_tx),
+            })
+            .is_ok()
+        {
+            let _ = reply_rx.recv();
+        }
+    }
+
+    /// Drains all currently available encoded dirty-rect patches without blocking.
+    pub fn drain_patches(&self) -> impl Iterator<Item = PaintPatch> + '_ {
+        self.patch_rx.try_iter()
+    }
+}
+
+impl Drop for CanvasPaintWorker {
+    fn drop(&mut self) {
+        let _ = self.cmd_tx.send(PaintCmd::Shutdown);
+        if let Some(handle) = self.join_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn run_paint_worker(
+    mut buffer: CanvasPaintBuffer,
+    timeline: CompiledTimeline,
+    palette: PalettePlan,
+    initial_epoch: u64,
+    cmd_rx: Receiver<PaintCmd>,
+    patch_tx: Sender<PaintPatch>,
+) {
+    let mut worker_epoch = initial_epoch;
+    let mut worker_t = 0.0_f64;
+
+    loop {
+        let first_cmd = match cmd_rx.recv() {
+            Ok(cmd) => cmd,
+            Err(_) => break,
+        };
+
+        let mut target_t: f64;
+        let mut target_epoch: u64;
+        let mut pending_replies: Vec<Sender<()>> = Vec::new();
+        let mut shutdown = false;
+
+        match first_cmd {
+            PaintCmd::Shutdown => break,
+            PaintCmd::AdvanceTo {
+                t_target,
+                reset_epoch,
+                sync_reply,
+            } => {
+                target_t = t_target;
+                target_epoch = reset_epoch;
+                if let Some(tx) = sync_reply {
+                    pending_replies.push(tx);
+                }
+            }
+        }
+
+        // Coalesce queued AdvanceTo commands for the same reset_epoch so we advance
+        // continuously across [worker_t, latest_t_target] without falling behind or skipping paint.
+        while let Ok(next_cmd) = cmd_rx.try_recv() {
+            match next_cmd {
+                PaintCmd::Shutdown => {
+                    shutdown = true;
+                    break;
+                }
+                PaintCmd::AdvanceTo {
+                    t_target,
+                    reset_epoch,
+                    sync_reply,
+                } => {
+                    if reset_epoch != target_epoch {
+                        for tx in pending_replies.drain(..) {
+                            let _ = tx.send(());
+                        }
+                        target_epoch = reset_epoch;
+                        target_t = t_target;
+                    } else {
+                        target_t = target_t.max(t_target);
+                    }
+                    if let Some(tx) = sync_reply {
+                        pending_replies.push(tx);
+                    }
+                }
+            }
+        }
+
+        if shutdown {
+            for tx in pending_replies.drain(..) {
+                let _ = tx.send(());
+            }
+            break;
+        }
+
+        if target_epoch != worker_epoch {
+            buffer.reset();
+            worker_epoch = target_epoch;
+            worker_t = 0.0;
+        }
+
+        if target_t > worker_t + 1e-9 {
+            if let Some((min_x, min_y, max_x, max_y)) =
+                buffer.deposit_timeline_interval(&timeline, &palette, worker_t, target_t)
+            {
+                let patch = buffer.encode_dirty_patch(min_x, min_y, max_x, max_y, worker_epoch);
+                let _ = patch_tx.send(patch);
+            }
+            worker_t = target_t;
+        }
+
+        for tx in pending_replies.drain(..) {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// Blits a tightly packed `rect_w * rect_h * 4` RGBA8 patch into a full `tex_w * tex_h * 4` buffer.
+pub fn blit_patch_to_rgba(
+    tex_bytes: &mut [u8],
+    tex_w: u32,
+    tex_h: u32,
+    min_x: u32,
+    min_y: u32,
+    max_x: u32,
+    max_y: u32,
+    patch: &[u8],
+) {
+    if min_x > max_x || min_y > max_y || max_x >= tex_w || max_y >= tex_h {
+        return;
+    }
+    let rect_w = (max_x - min_x + 1) as usize;
+    let rect_h = (max_y - min_y + 1) as usize;
+    let row_bytes = rect_w * 4;
+    if patch.len() != rect_h * row_bytes
+        || tex_bytes.len() < (tex_w as usize) * (tex_h as usize) * 4
+    {
+        return;
+    }
+
+    let stride = (tex_w as usize) * 4;
+    for dy in 0..rect_h {
+        let py = (min_y as usize) + dy;
+        let src_start = dy * row_bytes;
+        let dst_start = py * stride + (min_x as usize) * 4;
+        tex_bytes[dst_start..dst_start + row_bytes]
+            .copy_from_slice(&patch[src_start..src_start + row_bytes]);
+    }
+}
+
 fn setup_canvas(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -374,6 +994,7 @@ fn setup_canvas(
     mut images: ResMut<Assets<Image>>,
     app_config: Res<AppConfig>,
     clock: Res<SimClock>,
+    spray_job: Res<SprayJobRes>,
 ) {
     let studio = &app_config.studio;
     let tex_width = app_config.cli.canvas_res.max(1);
@@ -452,129 +1073,132 @@ fn setup_canvas(
         studio.canvas_height,
         app_config.cli.seed,
     );
+    let worker = CanvasPaintWorker::new(
+        buffer,
+        spray_job.timeline.clone(),
+        spray_job.palette.clone(),
+        clock.reset_epoch,
+    );
 
     commands.insert_resource(CanvasResources {
         albedo_tex,
         metallic_roughness_tex,
-        buffer,
+        tex_width,
+        tex_height,
+        worker,
         last_reset_epoch: clock.reset_epoch,
+        last_dispatched_t_sim: 0.0,
     });
 }
 
-fn update_canvas_deposition(
-    clock: Res<SimClock>,
-    spray_job: Res<SprayJobRes>,
-    mut canvas_res: ResMut<CanvasResources>,
-    mut images: ResMut<Assets<Image>>,
+fn reset_canvas_textures(
+    albedo_tex: &Handle<Image>,
+    mr_tex: &Handle<Image>,
+    images: &mut Assets<Image>,
 ) {
-    if clock.reset_epoch != canvas_res.last_reset_epoch {
-        canvas_res.buffer.reset();
-        canvas_res.last_reset_epoch = clock.reset_epoch;
-
-        let initial_roughness_byte = (BARE_CANVAS_ROUGHNESS * 255.0).round() as u8;
-        if let Some(mut albedo) = images.get_mut(&canvas_res.albedo_tex)
-            && let Some(data) = albedo.data.as_mut()
-        {
-            for px in data.chunks_exact_mut(4) {
-                px[0] = GESSO_SRGB[0];
-                px[1] = GESSO_SRGB[1];
-                px[2] = GESSO_SRGB[2];
-                px[3] = 255;
-            }
-        }
-        if let Some(mut mr) = images.get_mut(&canvas_res.metallic_roughness_tex)
-            && let Some(data) = mr.data.as_mut()
-        {
-            for px in data.chunks_exact_mut(4) {
-                px[0] = 0;
-                px[1] = initial_roughness_byte;
-                px[2] = 0;
-                px[3] = 255;
-            }
+    let initial_roughness_byte = (BARE_CANVAS_ROUGHNESS * 255.0).round() as u8;
+    if let Some(mut albedo) = images.get_mut(albedo_tex)
+        && let Some(data) = albedo.data.as_mut()
+    {
+        for px in data.chunks_exact_mut(4) {
+            px[0] = GESSO_SRGB[0];
+            px[1] = GESSO_SRGB[1];
+            px[2] = GESSO_SRGB[2];
+            px[3] = 255;
         }
     }
+    if let Some(mut mr) = images.get_mut(mr_tex)
+        && let Some(data) = mr.data.as_mut()
+    {
+        for px in data.chunks_exact_mut(4) {
+            px[0] = 0;
+            px[1] = initial_roughness_byte;
+            px[2] = 0;
+            px[3] = 255;
+        }
+    }
+}
 
-    if clock.t_sim <= clock.prev_t_sim {
+fn blit_worker_patches(canvas_res: &CanvasResources, images: &mut Assets<Image>) {
+    let patches: Vec<PaintPatch> = canvas_res
+        .worker
+        .drain_patches()
+        .filter(|patch| patch.reset_epoch == canvas_res.last_reset_epoch)
+        .collect();
+    if patches.is_empty() {
         return;
     }
 
-    let timeline = &spray_job.timeline;
-    let palette = &spray_job.palette;
-    let z_plane = canvas_res.buffer.canvas_center.z;
-
-    let mut dirty: Option<(u32, u32, u32, u32)> = None;
-    let mut t = clock.prev_t_sim;
-    let t_end = clock.t_sim;
-
-    while t < t_end - 1e-9 {
-        let dt_step = (t_end - t).min(ADAPTIVE_COARSE_DT);
-        let s0 = timeline.sample(t);
-        let s1 = timeline.sample(t + dt_step);
-
-        if !s0.spray_active && !s1.spray_active {
-            t += dt_step;
-            continue;
+    if let Some(mut albedo) = images.get_mut(&canvas_res.albedo_tex)
+        && let Some(albedo_bytes) = albedo.data.as_mut()
+    {
+        for patch in &patches {
+            blit_patch_to_rgba(
+                albedo_bytes,
+                canvas_res.tex_width,
+                canvas_res.tex_height,
+                patch.min_x,
+                patch.min_y,
+                patch.max_x,
+                patch.max_y,
+                &patch.albedo_patch,
+            );
         }
-
-        let active_ref = if s0.spray_active { &s0 } else { &s1 };
-        let standoff = (active_ref.nozzle_world_pos.z - z_plane).abs().max(0.025);
-        let spot_radius = standoff * active_ref.active_cap.cone_half_angle_rad().tan();
-        let max_disp = (0.25 * spot_radius).max(1e-4);
-
-        let nozzle_disp = (s1.nozzle_world_pos - s0.nozzle_world_pos).length();
-        let n_sub = (nozzle_disp / max_disp)
-            .ceil()
-            .clamp(1.0, MAX_SUBSTEPS_PER_COARSE as f32) as usize;
-        let dt_sub = dt_step / (n_sub as f64);
-
-        for k in 0..n_sub {
-            let t_mid = t + (k as f64 + 0.5) * dt_sub;
-            let frame = timeline.sample(t_mid);
-            if !frame.spray_active {
-                continue;
-            }
-            let Some(slot) = frame.held_can_slot else {
-                continue;
-            };
-            let Some(can) = palette.cans.get(slot) else {
-                continue;
-            };
-            let paint_linear = srgb_u8_to_linear_rgb(can.color_srgb);
-
-            if let Some(rect) = canvas_res.buffer.splat_cone_with_cap(
-                frame.nozzle_world_pos,
-                frame.nozzle_world_dir,
-                paint_linear,
-                frame.flow_scale,
-                dt_sub as f32,
-                frame.active_cap,
-            ) {
-                dirty = Some(match dirty {
-                    Some((x0, y0, x1, y1)) => {
-                        (x0.min(rect.0), y0.min(rect.1), x1.max(rect.2), y1.max(rect.3))
-                    }
-                    None => rect,
-                });
-            }
-        }
-
-        t += dt_step;
     }
 
-    if let Some((x0, y0, x1, y1)) = dirty {
-        if let Some(mut albedo) = images.get_mut(&canvas_res.albedo_tex)
-            && let Some(albedo_bytes) = albedo.data.as_mut()
-        {
-            canvas_res
-                .buffer
-                .sync_dirty_albedo(x0, y0, x1, y1, albedo_bytes);
+    if let Some(mut mr) = images.get_mut(&canvas_res.metallic_roughness_tex)
+        && let Some(mr_bytes) = mr.data.as_mut()
+    {
+        for patch in &patches {
+            blit_patch_to_rgba(
+                mr_bytes,
+                canvas_res.tex_width,
+                canvas_res.tex_height,
+                patch.min_x,
+                patch.min_y,
+                patch.max_x,
+                patch.max_y,
+                &patch.mr_patch,
+            );
         }
-        if let Some(mut mr) = images.get_mut(&canvas_res.metallic_roughness_tex)
-            && let Some(mr_bytes) = mr.data.as_mut()
-        {
+    }
+}
+
+fn update_canvas_deposition(
+    app_config: Res<AppConfig>,
+    clock: Res<SimClock>,
+    mut canvas_res: ResMut<CanvasResources>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    let mut reset_changed = false;
+    if clock.reset_epoch != canvas_res.last_reset_epoch {
+        reset_changed = true;
+        canvas_res.last_reset_epoch = clock.reset_epoch;
+        canvas_res.last_dispatched_t_sim = 0.0;
+        reset_canvas_textures(
+            &canvas_res.albedo_tex,
+            &canvas_res.metallic_roughness_tex,
+            &mut images,
+        );
+    }
+
+    let needs_advance = reset_changed || clock.t_sim > canvas_res.last_dispatched_t_sim + 1e-9;
+
+    if app_config.cli.record.is_some() {
+        if needs_advance {
             canvas_res
-                .buffer
-                .sync_dirty_roughness(x0, y0, x1, y1, mr_bytes);
+                .worker
+                .advance_sync(clock.t_sim, clock.reset_epoch);
+            canvas_res.last_dispatched_t_sim = clock.t_sim;
+        }
+        blit_worker_patches(&canvas_res, &mut images);
+    } else {
+        blit_worker_patches(&canvas_res, &mut images);
+        if needs_advance {
+            canvas_res
+                .worker
+                .advance_async(clock.t_sim, clock.reset_epoch);
+            canvas_res.last_dispatched_t_sim = clock.t_sim;
         }
     }
 }
@@ -696,6 +1320,51 @@ fn spatial_hash_01(px: u32, py: u32, seed: u64) -> f32 {
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^= z >> 31;
     ((z >> 40) as f32) / ((1_u32 << 24) as f32)
+}
+
+/// Applies deterministic aerosol rim droplet speckle modulation for `0.75 < u_cone <= 1.35`.
+#[inline]
+fn apply_rim_modulation(px: u32, py: u32, seed: u64, u_cone: f32, base_falloff: f32) -> f32 {
+    if u_cone <= 0.75 {
+        base_falloff
+    } else {
+        let rim_t = ((u_cone - 0.75) / 0.60).clamp(0.0, 1.0);
+        let h = spatial_hash_01(px, py, seed);
+        let droplet_prob = (1.0 - rim_t).powf(1.2) * 0.90 + 0.05;
+        if h < droplet_prob {
+            base_falloff * (0.70 + 0.60 * (1.0 - h))
+        } else {
+            base_falloff * 0.08 * (1.0 - rim_t)
+        }
+    }
+}
+
+#[inline]
+fn merge_dirty_rect(
+    acc: Option<(u32, u32, u32, u32)>,
+    rect: Option<(u32, u32, u32, u32)>,
+) -> Option<(u32, u32, u32, u32)> {
+    match (acc, rect) {
+        (Some((ax0, ay0, ax1, ay1)), Some((bx0, by0, bx1, by1))) => {
+            Some((ax0.min(bx0), ay0.min(by0), ax1.max(bx1), ay1.max(by1)))
+        }
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+/// Fast Abramowitz & Stegun 7.1.26 approximation of `erf(x)` (max error < 1.5e-7).
+#[inline]
+fn erf_f32(x: f32) -> f32 {
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let ax = x.abs();
+    let t = 1.0 / (1.0 + 0.327_591_1 * ax);
+    let poly = ((((1.061_405_4 * t - 1.453_152) * t + 1.421_413_8) * t - 0.284_496_72) * t
+        + 0.254_829_6)
+        * t;
+    let y = 1.0 - poly * (-ax * ax).exp();
+    sign * y
 }
 
 /// Verifies mesh UVs match our world-to-pixel mapping on a Bevy `Rectangle`.
@@ -954,5 +1623,347 @@ mod tests {
             coverage > 0.90,
             "Skinny centerline opacity/coverage should be high (> 0.90), got {coverage:.3}"
         );
+    }
+
+    #[test]
+    fn swept_segment_matches_fine_discrete_splats() {
+        use std::time::Instant;
+
+        let studio = StudioConfig::default();
+        let w = 1024_u32;
+        let h = 614_u32;
+        let paint_red = srgb_u8_to_linear_rgb([220, 45, 35]);
+        let paint_blue = srgb_u8_to_linear_rgb([35, 85, 225]);
+        let n_discrete = 100_usize;
+
+        for (cap, pos0, pos1, dir, dt, paint, label) in [
+            (
+                NozzleCap::Fat,
+                Vec3::new(-0.08, 1.55, 0.12),
+                Vec3::new(0.08, 1.55, 0.12),
+                Vec3::new(0.12, 0.0, -1.0).normalize(),
+                0.24_f32,
+                paint_red,
+                "Fat",
+            ),
+            (
+                NozzleCap::Skinny,
+                Vec3::new(-0.010, 1.55, 0.08),
+                Vec3::new(0.010, 1.55, 0.08),
+                Vec3::NEG_Z,
+                0.08_f32,
+                paint_blue,
+                "Skinny",
+            ),
+        ] {
+            let mut swept_buf = CanvasPaintBuffer::new(
+                w,
+                h,
+                studio.canvas_center,
+                studio.canvas_width,
+                studio.canvas_height,
+                42,
+            );
+            let mut discrete_buf = swept_buf.clone();
+
+            let swept_rect = swept_buf
+                .splat_swept_segment_with_cap(pos0, dir, pos1, dir, paint, 1.0, dt, cap)
+                .expect("swept segment should paint pixels");
+
+            let dt_sub = dt / (n_discrete as f32);
+            for k in 0..n_discrete {
+                let frac = (k as f32 + 0.5) / (n_discrete as f32);
+                let pos = pos0.lerp(pos1, frac);
+                discrete_buf.splat_cone_with_cap(pos, dir, paint, 1.0, dt_sub, cap);
+            }
+
+            let mut active_count = 0_usize;
+            let mut rgb_abs_sum = 0.0_f64;
+            let mut thick_abs_sum = 0.0_f64;
+            let mut core_count = 0_usize;
+            let mut core_rgb_abs_sum = 0.0_f64;
+            for py in swept_rect.1..=swept_rect.3 {
+                for px in swept_rect.0..=swept_rect.2 {
+                    let idx = (py as usize) * (w as usize) + (px as usize);
+                    if discrete_buf.thickness[idx] > 0.01 || swept_buf.thickness[idx] > 0.01 {
+                        active_count += 1;
+                        let dr = (swept_buf.linear_rgb[idx][0] - discrete_buf.linear_rgb[idx][0]).abs();
+                        let dg = (swept_buf.linear_rgb[idx][1] - discrete_buf.linear_rgb[idx][1]).abs();
+                        let db = (swept_buf.linear_rgb[idx][2] - discrete_buf.linear_rgb[idx][2]).abs();
+                        let mean_ch = ((dr + dg + db) / 3.0) as f64;
+                        rgb_abs_sum += mean_ch;
+                        thick_abs_sum +=
+                            (swept_buf.thickness[idx] - discrete_buf.thickness[idx]).abs() as f64;
+                        if discrete_buf.thickness[idx] > 0.15 {
+                            core_count += 1;
+                            core_rgb_abs_sum += mean_ch;
+                        }
+                    }
+                }
+            }
+
+            assert!(active_count > 10, "{label}: expected painted pixels");
+            assert!(core_count > 5, "{label}: expected core painted pixels");
+            let mae_rgb = rgb_abs_sum / (active_count as f64);
+            let core_mae_rgb = core_rgb_abs_sum / (core_count as f64);
+            let mae_thick = thick_abs_sum / (active_count as f64);
+            assert!(
+                core_mae_rgb < 0.015,
+                "{label}: swept vs 100-substep core RGB MAE too high: {core_mae_rgb:.5}"
+            );
+            assert!(
+                mae_rgb < 0.03,
+                "{label}: swept vs 100-substep RGB MAE too high: {mae_rgb:.5}"
+            );
+            assert!(
+                mae_thick < 0.05,
+                "{label}: swept vs 100-substep thickness MAE too high: {mae_thick:.5}"
+            );
+
+            // Benchmark swept vs 100-substep discrete deposition over 50 passes
+            let bench_iters = 50_usize;
+            let mut bench_swept = CanvasPaintBuffer::new(
+                w,
+                h,
+                studio.canvas_center,
+                studio.canvas_width,
+                studio.canvas_height,
+                42,
+            );
+            let t0 = Instant::now();
+            for _ in 0..bench_iters {
+                let _ = bench_swept.splat_swept_segment_with_cap(
+                    pos0, dir, pos1, dir, paint, 1.0, dt, cap,
+                );
+            }
+            let swept_us = t0.elapsed().as_micros() as f64 / bench_iters as f64;
+
+            let mut bench_disc = CanvasPaintBuffer::new(
+                w,
+                h,
+                studio.canvas_center,
+                studio.canvas_width,
+                studio.canvas_height,
+                42,
+            );
+            let t1 = Instant::now();
+            for _ in 0..bench_iters {
+                for k in 0..n_discrete {
+                    let frac = (k as f32 + 0.5) / (n_discrete as f32);
+                    let pos = pos0.lerp(pos1, frac);
+                    let _ = bench_disc.splat_cone_with_cap(pos, dir, paint, 1.0, dt_sub, cap);
+                }
+            }
+            let disc_us = t1.elapsed().as_micros() as f64 / bench_iters as f64;
+            let speedup = disc_us / swept_us.max(1e-3);
+            println!(
+                "[bench {label}] swept={swept_us:.1} us/seg vs discrete({n_discrete}x)={disc_us:.1} us/seg ({speedup:.1}x speedup), core_mae_rgb={core_mae_rgb:.5}, mae_rgb={mae_rgb:.5}, mae_thick={mae_thick:.5}"
+            );
+            assert!(
+                swept_us < disc_us,
+                "{label}: swept ({swept_us:.1} us) should be faster than 100x discrete ({disc_us:.1} us)"
+            );
+        }
+    }
+
+    #[test]
+    fn canvas_worker_decoupled_advance_coalescing_and_reset() {
+        use crate::core::kinematics::KinematicChain;
+        use crate::core::types::{JobOp, JobPlan, SprayCanSpec, StrokeWaypoint};
+
+        let studio = StudioConfig::default();
+        let chain = KinematicChain::default_spraybot(&studio);
+        let palette = PalettePlan {
+            cans: vec![SprayCanSpec {
+                slot_index: 0,
+                color_srgb: [220, 45, 35],
+                label: "Red".to_string(),
+            }],
+            primitive_color_map: Vec::new(),
+        };
+        let job = JobPlan {
+            ops: vec![
+                JobOp::PickCan { slot: 0 },
+                JobOp::PaintStroke {
+                    points_canvas_3d: vec![
+                        StrokeWaypoint {
+                            pos: Vec3::new(-0.20, 1.55, 0.0),
+                            normal: Vec3::Z,
+                            aim_dir: Vec3::NEG_Z,
+                            standoff: 0.12,
+                            feed_speed: 0.35,
+                            valve_on: true,
+                            opacity_scale: 1.0,
+                            cap: NozzleCap::Fat,
+                        },
+                        StrokeWaypoint {
+                            pos: Vec3::new(0.20, 1.55, 0.0),
+                            normal: Vec3::Z,
+                            aim_dir: Vec3::NEG_Z,
+                            standoff: 0.12,
+                            feed_speed: 0.35,
+                            valve_on: true,
+                            opacity_scale: 1.0,
+                            cap: NozzleCap::Fat,
+                        },
+                    ],
+                },
+                JobOp::ReturnCan { slot: 0 },
+                JobOp::ParkHome,
+            ],
+        };
+        let timeline = CompiledTimeline::compile(&job, &chain, &studio).expect("compile job");
+        let total_t = timeline.duration();
+        assert!(total_t > 0.5);
+
+        let w = 512_u32;
+        let h = 307_u32;
+        let mut ref_buf = CanvasPaintBuffer::new(
+            w,
+            h,
+            studio.canvas_center,
+            studio.canvas_width,
+            studio.canvas_height,
+            42,
+        );
+        let ref_rect = ref_buf
+            .deposit_timeline_interval(&timeline, &palette, 0.0, total_t)
+            .expect("reference timeline should paint canvas");
+        let mut ref_albedo = vec![0_u8; (w as usize) * (h as usize) * 4];
+        let mut ref_mr = vec![0_u8; (w as usize) * (h as usize) * 4];
+        for px in ref_albedo.chunks_exact_mut(4) {
+            px[0] = GESSO_SRGB[0];
+            px[1] = GESSO_SRGB[1];
+            px[2] = GESSO_SRGB[2];
+            px[3] = 255;
+        }
+        let init_rough = (BARE_CANVAS_ROUGHNESS * 255.0).round() as u8;
+        for px in ref_mr.chunks_exact_mut(4) {
+            px[0] = 0;
+            px[1] = init_rough;
+            px[2] = 0;
+            px[3] = 255;
+        }
+        ref_buf.sync_dirty_rect(0, 0, w - 1, h - 1, &mut ref_albedo, &mut ref_mr);
+
+        let worker_buf = CanvasPaintBuffer::new(
+            w,
+            h,
+            studio.canvas_center,
+            studio.canvas_width,
+            studio.canvas_height,
+            42,
+        );
+        let worker = CanvasPaintWorker::new(worker_buf, timeline, palette, 0);
+
+        // Queue many rapid async advances to exercise worker-side coalescing, then sync at end
+        for i in 1..=25 {
+            let t = total_t * (i as f64) / 25.0;
+            worker.advance_async(t, 0);
+        }
+        worker.advance_sync(total_t, 0);
+
+        let mut albedo_tex = vec![0_u8; (w as usize) * (h as usize) * 4];
+        let mut mr_tex = vec![0_u8; (w as usize) * (h as usize) * 4];
+        let reset_tex = |albedo: &mut [u8], mr: &mut [u8]| {
+            for px in albedo.chunks_exact_mut(4) {
+                px[0] = GESSO_SRGB[0];
+                px[1] = GESSO_SRGB[1];
+                px[2] = GESSO_SRGB[2];
+                px[3] = 255;
+            }
+            for px in mr.chunks_exact_mut(4) {
+                px[0] = 0;
+                px[1] = init_rough;
+                px[2] = 0;
+                px[3] = 255;
+            }
+        };
+        reset_tex(&mut albedo_tex, &mut mr_tex);
+
+        let patches_ep0: Vec<PaintPatch> = worker.drain_patches().collect();
+        assert!(!patches_ep0.is_empty(), "expected dirty patches for epoch 0");
+        for p in &patches_ep0 {
+            assert_eq!(p.reset_epoch, 0);
+            let rw = (p.max_x - p.min_x + 1) as usize;
+            let rh = (p.max_y - p.min_y + 1) as usize;
+            assert_eq!(p.albedo_patch.len(), rw * rh * 4);
+            assert_eq!(p.mr_patch.len(), rw * rh * 4);
+            blit_patch_to_rgba(
+                &mut albedo_tex,
+                w,
+                h,
+                p.min_x,
+                p.min_y,
+                p.max_x,
+                p.max_y,
+                &p.albedo_patch,
+            );
+            blit_patch_to_rgba(
+                &mut mr_tex,
+                w,
+                h,
+                p.min_x,
+                p.min_y,
+                p.max_x,
+                p.max_y,
+                &p.mr_patch,
+            );
+        }
+
+        // Verify center stroke pixel painted and blitted textures match reference closely
+        let center_px = ref_buf.world_to_pixel(Vec2::new(0.0, 1.55)).unwrap();
+        let center_base = ((center_px.1 as usize) * (w as usize) + (center_px.0 as usize)) * 4;
+        assert!(
+            albedo_tex[center_base] > 180 && albedo_tex[center_base + 1] < 100,
+            "center pixel should be painted red, got {:?}",
+            &albedo_tex[center_base..center_base + 3]
+        );
+        let mut max_byte_diff = 0_u8;
+        for py in ref_rect.1..=ref_rect.3 {
+            for px in ref_rect.0..=ref_rect.2 {
+                let base = ((py as usize) * (w as usize) + (px as usize)) * 4;
+                for c in 0..3 {
+                    max_byte_diff = max_byte_diff.max(albedo_tex[base + c].abs_diff(ref_albedo[base + c]));
+                }
+                max_byte_diff = max_byte_diff.max(mr_tex[base + 1].abs_diff(ref_mr[base + 1]));
+            }
+        }
+        assert!(
+            max_byte_diff <= 2,
+            "coalesced worker blit should match reference within 2 sRGB/MR bytes, got {max_byte_diff}"
+        );
+
+        // Exercise reset_epoch transition (R key reset): reset to 0.0, advance, and verify epoch filtering
+        reset_tex(&mut albedo_tex, &mut mr_tex);
+        worker.advance_async(0.0, 1);
+        worker.advance_sync(total_t, 1);
+        let patches_ep1: Vec<PaintPatch> = worker
+            .drain_patches()
+            .filter(|p| p.reset_epoch == 1)
+            .collect();
+        assert!(!patches_ep1.is_empty(), "expected dirty patches after reset_epoch=1");
+        for p in &patches_ep1 {
+            blit_patch_to_rgba(
+                &mut albedo_tex,
+                w,
+                h,
+                p.min_x,
+                p.min_y,
+                p.max_x,
+                p.max_y,
+                &p.albedo_patch,
+            );
+        }
+        assert_eq!(albedo_tex[center_base], ref_albedo[center_base]);
+
+        // Reset back to t=0.0 at epoch 2 and ensure no paint is emitted
+        worker.advance_sync(0.0, 2);
+        assert!(
+            worker.drain_patches().next().is_none(),
+            "reset to t=0.0 should emit no paint patches"
+        );
+
+        drop(worker);
     }
 }

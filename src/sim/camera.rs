@@ -26,11 +26,28 @@ const MIN_PITCH: f32 = -FRAC_PI_2 + 0.05;
 const MAX_PITCH: f32 = FRAC_PI_2 - 0.05;
 const MIN_DISTANCE: f32 = 0.45;
 const MAX_DISTANCE: f32 = 7.50;
-const SPRAY_CONE_HALF_ANGLE_RAD: f32 = 12.0 * PI / 180.0;
 
 /// Marker component for the main 3D studio camera.
 #[derive(Component)]
 pub struct MainStudioCamera;
+
+/// Marker component for the root node of the live-view Studio HUD.
+#[derive(Component)]
+struct StudioHudRoot;
+
+/// Marker component for the live-view Studio HUD text block.
+#[derive(Component)]
+struct StudioHudText;
+
+/// Controls whether the live-view Studio HUD overlay is visible (`H` hotkey).
+#[derive(Resource, Debug, Clone, Copy)]
+struct HudVisible(bool);
+
+impl Default for HudVisible {
+    fn default() -> Self {
+        Self(true)
+    }
+}
 
 /// Orbit/pan/zoom/follow state for the studio camera.
 #[derive(Resource, Debug, Clone)]
@@ -87,13 +104,14 @@ impl CameraRig {
     }
 }
 
-/// Registers camera spawning, hotkey input handling, mouse orbit/pan/zoom, and 3D gizmos.
+/// Registers camera spawning, hotkey input handling, mouse orbit/pan/zoom, 3D gizmos, and live HUD.
 pub fn plugin(app: &mut App) {
-    app.add_systems(Startup, spawn_camera)
+    app.init_resource::<HudVisible>()
+        .add_systems(Startup, (spawn_camera, spawn_studio_hud).chain())
         .add_systems(Update, handle_hotkeys.in_set(SimStepSet::InputAndClock))
         .add_systems(
             Update,
-            (update_camera_rig, draw_debug_gizmos)
+            (update_camera_rig, draw_debug_gizmos, update_studio_hud)
                 .chain()
                 .in_set(SimStepSet::CameraAndGizmos),
         );
@@ -128,12 +146,47 @@ fn spawn_camera(
     commands.insert_resource(rig);
 }
 
+fn spawn_studio_hud(
+    mut commands: Commands,
+    app_config: Res<AppConfig>,
+    clock: Res<SimClock>,
+    job: Res<SprayJobRes>,
+    rig: Res<CameraRig>,
+) {
+    if app_config.cli.record.is_some() {
+        return;
+    }
+
+    let initial_text = format_studio_hud_text(&clock, &job, &rig);
+    commands.spawn((
+        StudioHudRoot,
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(12.0),
+            left: Val::Px(12.0),
+            padding: UiRect::axes(Val::Px(12.0), Val::Px(8.0)),
+            border_radius: BorderRadius::all(Val::Px(6.0)),
+            ..default()
+        },
+        BackgroundColor(Color::srgba(0.05, 0.06, 0.08, 0.78)),
+        Visibility::Inherited,
+        children![(
+            StudioHudText,
+            Text::new(initial_text),
+            TextFont::from_font_size(13.5),
+            TextColor(Srgba::hex("#E8ECF2").unwrap().into()),
+        )],
+    ));
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_hotkeys(
     keys: Res<ButtonInput<KeyCode>>,
     app_config: Res<AppConfig>,
     mut clock: ResMut<SimClock>,
     mut job: ResMut<SprayJobRes>,
     mut rig: ResMut<CameraRig>,
+    mut hud_visible: ResMut<HudVisible>,
     mut shutdown_req: ResMut<GracefulShutdownRequested>,
     mut app_exit: MessageWriter<AppExit>,
 ) {
@@ -163,6 +216,10 @@ fn handle_hotkeys(
     if keys.just_pressed(KeyCode::KeyG) {
         clock.show_gizmos = !clock.show_gizmos;
         job.show_gizmos = clock.show_gizmos;
+    }
+
+    if app_config.cli.record.is_none() && keys.just_pressed(KeyCode::KeyH) {
+        hud_visible.0 = !hud_visible.0;
     }
 
     if keys.just_pressed(KeyCode::KeyR) {
@@ -296,13 +353,13 @@ fn draw_debug_gizmos(mut gizmos: Gizmos, clock: Res<SimClock>, job: Res<SprayJob
     let tcp_rot = Quat::from_rotation_arc(Vec3::NEG_Z, dir);
     gizmos.axes(Transform::from_translation(apex).with_rotation(tcp_rot), 0.10);
 
-    // 3. 12-degree spray cone wireframe from nozzle tip toward canvas (Z = 0.0).
+    // 3. Dynamic cap-aware spray cone wireframe from nozzle tip toward canvas (Z = 0.0).
     let cone_len = if dir.z < -1e-3 && apex.z > 0.0 {
         (apex.z / -dir.z).clamp(0.04, 0.35)
     } else {
         0.22
     };
-    let cone_radius = cone_len * SPRAY_CONE_HALF_ANGLE_RAD.tan();
+    let cone_radius = cone_len * frame.active_cap.cone_half_angle_rad().tan();
     let cone_base_center = apex + dir * cone_len;
     let cone_color = if frame.spray_active {
         Color::srgba(0.25, 1.0, 0.40, 0.95)
@@ -323,6 +380,98 @@ fn draw_debug_gizmos(mut gizmos: Gizmos, clock: Res<SimClock>, job: Res<SprayJob
         let rim_pt = cone_base_center + (right * cos_a + up * sin_a) * cone_radius;
         gizmos.line(apex, rim_pt, cone_color);
     }
+}
+
+fn update_studio_hud(
+    app_config: Res<AppConfig>,
+    clock: Res<SimClock>,
+    job: Res<SprayJobRes>,
+    rig: Res<CameraRig>,
+    hud_visible: Res<HudVisible>,
+    mut root_q: Query<&mut Visibility, With<StudioHudRoot>>,
+    mut text_q: Query<&mut Text, With<StudioHudText>>,
+) {
+    if app_config.cli.record.is_some() {
+        return;
+    }
+
+    let vis = if hud_visible.0 {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
+    for mut root_vis in &mut root_q {
+        *root_vis = vis;
+    }
+
+    if hud_visible.0 {
+        let formatted = format_studio_hud_text(&clock, &job, &rig);
+        for mut text in &mut text_q {
+            text.0 = formatted.clone();
+        }
+    }
+}
+
+#[inline]
+fn format_mm_ss(secs: f64) -> String {
+    let total = secs.max(0.0).floor() as u64;
+    format!("{:02}:{:02}", total / 60, total % 60)
+}
+
+/// Formats the 3-line Live-View Studio HUD string from the current playback, camera, and cap state.
+pub fn format_studio_hud_text(clock: &SimClock, job: &SprayJobRes, rig: &CameraRig) -> String {
+    let status = if clock.finished {
+        "DONE"
+    } else if clock.paused {
+        "PAUSED"
+    } else {
+        "PLAYING"
+    };
+    let pct = if clock.total_duration > 1e-6 {
+        ((clock.t_sim / clock.total_duration) * 100.0)
+            .clamp(0.0, 100.0)
+            .round() as u32
+    } else {
+        100
+    };
+    let line1 = format!(
+        "{status}  |  {:.2}x  |  {} / {} ({pct}%)",
+        clock.speed,
+        format_mm_ss(clock.t_sim),
+        format_mm_ss(clock.total_duration),
+    );
+
+    let preset_str = match rig.active_preset {
+        Some(CameraPreset::Overview) => "Overview",
+        Some(CameraPreset::Follow) => "Follow",
+        Some(CameraPreset::Rack) => "Rack",
+        Some(CameraPreset::Canvas) => "Canvas",
+        None => "Free",
+    };
+    let frame = &job.current_frame;
+    let can_str = match frame.held_can_slot {
+        Some(slot) => match job.palette.cans.get(slot) {
+            Some(can) => format!(
+                "Can #{slot} (#{:02X}{:02X}{:02X})",
+                can.color_srgb[0], can.color_srgb[1], can.color_srgb[2]
+            ),
+            None => format!("Can #{slot}"),
+        },
+        None => "None".to_string(),
+    };
+    let gizmos_str = if clock.show_gizmos {
+        "Gizmos: ON"
+    } else {
+        "Gizmos: OFF"
+    };
+    let line2 = format!(
+        "{preset_str}  |  {can_str}  |  {}  |  {gizmos_str}",
+        frame.active_cap.label()
+    );
+    let line3 =
+        "[ / ] Speed  |  Space Pause  |  1-4 Cam  |  G Gizmos  |  H HUD  |  R Reset  |  Q Quit";
+
+    format!("{line1}\n{line2}\n{line3}")
 }
 
 /// Returns `(eye, target)` world coordinates for each named [`CameraPreset`].
@@ -420,5 +569,62 @@ mod tests {
         assert_relative_eq!(outside_walls.x, STUDIO_MAX_X, epsilon = 1e-6);
         assert_relative_eq!(outside_walls.y, STUDIO_MAX_Y, epsilon = 1e-6);
         assert_relative_eq!(outside_walls.z, STUDIO_MIN_Z, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn studio_hud_text_formats_playback_can_cap_and_controls() {
+        use crate::core::types::{NozzleCap, SprayCanSpec, StudioConfig};
+
+        let studio = StudioConfig::default();
+        let mut job = SprayJobRes::empty(&studio);
+        job.palette.cans.push(SprayCanSpec {
+            slot_index: 2,
+            color_srgb: [0x1A, 0x7F, 0xE8],
+            label: "Cobalt".to_string(),
+        });
+        job.palette.cans.resize(
+            3,
+            SprayCanSpec {
+                slot_index: 2,
+                color_srgb: [0x1A, 0x7F, 0xE8],
+                label: "Cobalt".to_string(),
+            },
+        );
+        job.current_frame.held_can_slot = Some(2);
+        job.current_frame.active_cap = NozzleCap::Skinny;
+
+        let mut clock = SimClock {
+            t_sim: 65.0,
+            total_duration: 130.0,
+            speed: 2.0,
+            paused: true,
+            show_gizmos: true,
+            ..Default::default()
+        };
+        let mut rig = CameraRig::from_preset(CameraPreset::Follow, Vec3::ZERO);
+        let text = format_studio_hud_text(&clock, &job, &rig);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("PAUSED"));
+        assert!(lines[0].contains("2.00x"));
+        assert!(lines[0].contains("01:05 / 02:10 (50%)"));
+        assert!(lines[1].contains("Follow"));
+        assert!(lines[1].contains("Can #2 (#1A7FE8)"));
+        assert!(lines[1].contains("Skinny Cap (2.6°)"));
+        assert!(lines[1].contains("Gizmos: ON"));
+        assert!(lines[2].contains("H HUD"));
+
+        clock.paused = false;
+        clock.finished = true;
+        clock.show_gizmos = false;
+        rig.active_preset = None;
+        job.current_frame.held_can_slot = None;
+        job.current_frame.active_cap = NozzleCap::Fat;
+        let text2 = format_studio_hud_text(&clock, &job, &rig);
+        assert!(text2.contains("DONE"));
+        assert!(text2.contains("Free"));
+        assert!(text2.contains("None"));
+        assert!(text2.contains("Fat Cap (12°)"));
+        assert!(text2.contains("Gizmos: OFF"));
     }
 }

@@ -1,8 +1,9 @@
 use bevy::prelude::*;
 
+use crate::core::types::NozzleCap;
 use crate::sim::robot_view::{
-    CanEntity, GripperJaw, HeldCanSlot, RobotLink, StudioRackCache, TriggerFinger,
-    jaw_local_translation, trigger_local_transform,
+    CanCapVisual, CanEntity, GripperJaw, HeldCanSlot, RobotLink, SlotCapVisualState,
+    StudioRackCache, TriggerFinger, jaw_local_translation, trigger_local_transform,
 };
 use crate::sim::state::{AppConfig, SimClock, SimStepSet, SprayJobRes};
 
@@ -56,15 +57,28 @@ fn update_robot_kinematics(
     clock: Res<SimClock>,
     mut spray_job: ResMut<SprayJobRes>,
     mut held_can: ResMut<HeldCanSlot>,
+    mut slot_caps: ResMut<SlotCapVisualState>,
+    mut last_reset_epoch: Local<u64>,
     rack_cache: Res<StudioRackCache>,
     mut link_q: Query<(&RobotLink, &mut Transform), (Without<GripperJaw>, Without<TriggerFinger>, Without<CanEntity>)>,
     mut jaw_q: Query<(&GripperJaw, &mut Transform), (Without<RobotLink>, Without<TriggerFinger>, Without<CanEntity>)>,
     mut trigger_q: Query<&mut Transform, (With<TriggerFinger>, Without<RobotLink>, Without<GripperJaw>, Without<CanEntity>)>,
     mut can_q: Query<(&CanEntity, &mut Transform), (Without<RobotLink>, Without<GripperJaw>, Without<TriggerFinger>)>,
+    mut cap_vis_q: Query<(&CanCapVisual, &mut Visibility)>,
 ) {
+    if clock.reset_epoch != *last_reset_epoch {
+        *last_reset_epoch = clock.reset_epoch;
+        slot_caps.0.fill(NozzleCap::Fat);
+    }
+
     let frame = spray_job.timeline.sample(clock.t_sim);
     spray_job.current_frame = frame;
     held_can.0 = frame.held_can_slot;
+    if let Some(slot) = frame.held_can_slot
+        && let Some(entry) = slot_caps.0.get_mut(slot)
+    {
+        *entry = frame.active_cap;
+    }
 
     let link_xforms = spray_job.chain.fk_links(&frame.joints);
     for (link, mut tf) in &mut link_q {
@@ -91,6 +105,15 @@ fn update_robot_kinematics(
             tf.translation = slot_pose.grasp_pos;
             tf.rotation = slot_pose.grasp_rot;
         }
+    }
+
+    for (cap_vis, mut vis) in &mut cap_vis_q {
+        let mounted_cap = slot_caps.0.get(cap_vis.slot).copied().unwrap_or_default();
+        *vis = if cap_vis.cap == mounted_cap {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
     }
 }
 

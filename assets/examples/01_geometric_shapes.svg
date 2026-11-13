@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600" width="1000" height="600">
+  <title>SprayBot Geometric Shapes Showcase</title>
+
+  <!-- 1. Varying stroke-width curves & polylines (8px to 60px) -->
+  <g id="stroke-widths">
+    <!-- Extra-wide 60px S-curve -> triggers buffered-polygon stroke -->
+    <path d="M 70 110 C 260 60, 80 260, 290 210"
+          fill="none" stroke="#E63946" stroke-width="60" stroke-linecap="round"/>
+
+    <!-- Wide 34px zig-zag -> wide single-pass standoff -->
+    <polyline points="65,330 145,260 220,350 300,275"
+              fill="none" stroke="#1D4ED8" stroke-width="34" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <!-- Medium 18px sweeping arc -> mid single-pass standoff -->
+    <path d="M 65 445 Q 185 375 305 455"
+          fill="none" stroke="#F59E0B" stroke-width="18" stroke-linecap="round"/>
+
+    <!-- Thin 8px precision geometric frame & inner line -> close standoff -->
+    <polyline points="65,530 130,490 195,530 260,490 315,525"
+              fill="none" stroke="#1F2937" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="185" cy="160" r="38" fill="none" stroke="#1F2937" stroke-width="8"/>
+  </g>
+
+  <!-- 2. Overlapping vivid circles, triangles, and stars (Painter's Z-order test) -->
+  <g id="z-order-stack">
+    <!-- Back: Large teal circle -->
+    <circle cx="485" cy="295" r="175" fill="#00A896"/>
+
+    <!-- Mid-back: Bold orange triangle overlapping teal circle -->
+    <polygon points="485,85 655,415 320,415" fill="#FF7B00"/>
+
+    <!-- Mid-front: Magenta 5-pointed star overlapping circle and triangle -->
+    <polygon points="485,155 524,242 618,252 548,316 567,409 485,361 403,409 422,316 352,252 446,242"
+             fill="#E6007A"/>
+
+    <!-- Front-1: Bright cyan circle with dark navy stroke -->
+    <circle cx="535" cy="335" r="64" fill="#00E5FF" stroke="#14213D" stroke-width="10"/>
+
+    <!-- Front-2: Lime green accent triangle overlapping star & cyan circle -->
+    <polygon points="430,305 510,365 415,415" fill="#8AC926"/>
+  </g>
+
+  <!-- 3. Compound polygons with holes using fill-rule="evenodd" -->
+  <g id="evenodd-compounds">
+    <!-- Outer octagon with two distinct interior holes (square + diamond) -->
+    <path d="M 755 70 L 895 70 L 950 125 L 950 265 L 895 320 L 755 320 L 700 265 L 700 125 Z
+             M 750 115 L 820 115 L 820 185 L 750 185 Z
+             M 865 180 L 915 230 L 865 280 L 815 230 Z"
+          fill="#5E2BFF" fill-rule="evenodd"/>
+
+    <!-- Compound 6-point star with centered hexagon hole + 10px outline -->
+    <path d="M 825 360 L 856 414 L 918 414 L 887 468 L 918 522 L 856 522 L 825 576 L 794 522 L 732 522 L 763 468 L 732 414 L 794 414 Z
+             M 825 426 L 861 447 L 861 489 L 825 510 L 789 489 L 789 447 Z"
+          fill="#00C49A" fill-rule="evenodd" stroke="#14213D" stroke-width="10" stroke-linejoin="round"/>
+  </g>
+</svg>

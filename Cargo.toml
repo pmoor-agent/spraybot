@@ -1,0 +1,45 @@
+[package]
+name = "spraybot"
+version = "0.1.0"
+edition = "2024"
+description = "SprayBot 3D industrial mural painting robot simulator and offline video renderer"
+
+[features]
+default = []
+fast-dev = ["bevy/dynamic_linking"]
+
+[dependencies]
+bevy = { version = "0.20.1", default-features = false, features = [
+    "default_app",
+    "3d_bevy_render",
+    "scene",
+    "std",
+    "bevy_winit",
+    "multi_threaded",
+    "x11",
+    "wayland",
+    "keyboard",
+    "mouse",
+    "hdr",
+    "png",
+    "ktx2",
+    "tonemapping_luts",
+    "smaa_luts",
+    "zstd_rust",
+] }
+# Enable runtime dlopen for libwayland-* so wayland-devel (.pc files) is not required at build time
+wayland-backend = { version = "0.3", features = ["dlopen"] }
+clap = { version = "4.5", features = ["derive"] }
+glam = { version = "0.33.2", features = ["f64"] }
+nalgebra = "0.35.0"
+usvg = "0.50.0"
+fontdb = "0.24.0"
+kurbo = "0.13.0"
+geo = "0.33.1"
+i_overlay = "9.1.0"
+image = { version = "0.25", default-features = false, features = ["png", "hdr"] }
+png = "0.17"
+crossbeam-channel = "0.5"
+
+[dev-dependencies]
+approx = "0.5"

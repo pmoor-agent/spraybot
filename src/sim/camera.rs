@@ -1,12 +1,15 @@
 use std::f32::consts::{FRAC_PI_2, PI};
 
 use bevy::{
+    anti_alias::smaa::Smaa,
     app::AppExit,
     camera::{Hdr, RenderTarget},
     core_pipeline::tonemapping::Tonemapping,
     input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel},
+    pbr::{ScreenSpaceAmbientOcclusion, ScreenSpaceAmbientOcclusionQualityLevel},
     post_process::bloom::Bloom,
     prelude::*,
+    render::view::Msaa,
 };
 
 use crate::cli::CameraPreset;
@@ -152,12 +155,21 @@ fn spawn_camera(
     let transform = Transform::from_translation(eye).looking_at(rig.current_target, Vec3::Y);
 
     let mut bloom = Bloom::NATURAL;
-    bloom.intensity = 0.08;
+    bloom.intensity = 0.065;
+    bloom.low_frequency_boost = 0.45;
+    bloom.high_pass_frequency = 0.90;
 
     let mut entity = commands.spawn((
         MainStudioCamera,
         Camera3d::default(),
         Hdr,
+        Msaa::Off,
+        Smaa::default(),
+        ScreenSpaceAmbientOcclusion {
+            quality_level: ScreenSpaceAmbientOcclusionQualityLevel::High,
+            radius: 0.30,
+            constant_object_thickness: 0.08,
+        },
         Tonemapping::AcesFitted,
         bloom,
         transform,

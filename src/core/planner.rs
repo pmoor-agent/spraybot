@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use geo::algorithm::area::Area;
 use geo::algorithm::bool_ops::{BooleanOps, FillRule as GeoFillRule};
 use geo::algorithm::bounding_rect::BoundingRect;
-use geo::algorithm::buffer::{Buffer, BufferStyle};
+use geo::algorithm::buffer::{Buffer, BufferStyle, LineJoin};
 use geo::algorithm::contains::Contains;
 use geo::line_measures::LengthMeasurable;
 use geo::{Coord, Line, LineString, MultiLineString, MultiPolygon, Polygon};
@@ -313,6 +313,65 @@ fn emit_medial_core_between(
     }
 }
 
+/// Detects narrower bridges or sub-lobes of `poly` that collapsed between `prev_offset` and
+/// `next_offset` while wider regions survived in `next_mp`, and emits a centered medial pass
+/// for each collapsed component at a safe standoff bounded by `prev_d`.
+#[allow(clippy::too_many_arguments)]
+fn emit_partially_collapsed_bridges(
+    poly: &Polygon<f64>,
+    prev_offset: f64,
+    next_offset: f64,
+    next_mp: &MultiPolygon<f64>,
+    prev_d: f32,
+    prev_w: f64,
+    fill_flow: f32,
+    cap: NozzleCap,
+    config: &PlannerConfig,
+    out: &mut Vec<JobOp>,
+) {
+    let probe_offset = prev_offset + 0.25 * prev_w;
+    if probe_offset >= next_offset - 1e-5 {
+        return;
+    }
+    let probe_mp = filter_valid_mp(poly.buffer(-probe_offset));
+    if probe_mp.0.is_empty() {
+        return;
+    }
+
+    let cover_margin = (next_offset - probe_offset) + 0.002;
+    let cover_style = BufferStyle::new(cover_margin).line_join(LineJoin::Miter(0.35));
+    let covered_by_next = filter_valid_mp(next_mp.buffer_with_style(cover_style));
+    let collapsed = filter_valid_mp(probe_mp.difference(&covered_by_next));
+
+    let tan_theta = cap.cone_half_angle_rad().tan() as f64;
+    let (d_min, _, _) = cap_standoff_bounds(cap, config);
+    let d_safe_probe = (probe_offset / (0.48 * 2.0 * tan_theta)) as f32;
+    let d_bridge = prev_d.min(d_safe_probe.max(d_min));
+    let min_mean_half_width = 0.001_f64.min(0.05 * prev_w);
+
+    for cp in &collapsed.0 {
+        let area = cp.unsigned_area();
+        if area < 2e-5 {
+            continue;
+        }
+        let perim = cp.exterior().length(&geo::Euclidean);
+        if perim <= 1e-5 || (2.0 * area / perim) < min_mean_half_width {
+            continue;
+        }
+        emit_medial_core_between(
+            cp,
+            0.0,
+            next_offset - probe_offset,
+            d_bridge,
+            prev_w,
+            fill_flow,
+            cap,
+            config,
+            out,
+        );
+    }
+}
+
 /// Peels concentric contour-offset rings inward from the perimeter pass, bridging any
 /// narrow residual centerlines with a medial pass and handing off large hole-free cores
 /// to boustrophedon hatching with tight overlap.
@@ -363,6 +422,19 @@ fn plan_concentric_infill(
             return;
         }
 
+        emit_partially_collapsed_bridges(
+            poly,
+            prev_offset,
+            offset,
+            &ring_mp,
+            prev_d,
+            prev_w,
+            fill_flow,
+            cap,
+            config,
+            out,
+        );
+
         let d_safe_max = (offset / (0.48 * 2.0 * tan_theta)) as f32;
         let d_k = if d_safe_max >= d_fill_min {
             d_safe_max.clamp(d_fill_min, d_fill_max)
@@ -402,6 +474,18 @@ fn plan_concentric_infill(
                 return;
             }
             if remaining.0.iter().all(|p| p.interiors().is_empty()) {
+                emit_partially_collapsed_bridges(
+                    poly,
+                    prev_offset,
+                    handoff_offset,
+                    &remaining,
+                    prev_d,
+                    prev_w,
+                    fill_flow,
+                    cap,
+                    config,
+                    out,
+                );
                 let max_safe_d = ((handoff_offset / (0.45 * 2.0 * tan_theta)) as f32).max(d_perim);
                 plan_boustrophedon_hatch_bounded(
                     &remaining,
@@ -2233,6 +2317,106 @@ mod tests {
             sample_coverage(&buf, 0.075, 1.55, paint_srgb) < 0.05,
             "right shield cutout must stay clean"
         );
+    }
+
+    #[test]
+    fn fcz_holed_shield_central_bridge_between_cutouts_has_solid_coverage() {
+        let cx = 0.0_f64;
+        let cy = 1.55_f64;
+        let paint_srgb = [11, 46, 107];
+        // Matches FCZ shield proportions: r_out=40.6cm, 15.2cm central bridge between ~11.2cm
+        // vertical cutouts, ~18-20cm side lobes, and top semicircle cutout above horizontal bar.
+        let r_out = 0.4065_f64;
+        let r_in = 0.3730_f64;
+        let outer = circle_ring(cx, cy, r_out, 96, true);
+
+        // Top semicircle cutout (CW) above y = cy + 0.0357.
+        let y_top_bar = cy + 0.0357;
+        let dy_top = y_top_bar - cy;
+        let theta_top = (dy_top / r_in).asin();
+        let mut top_hole_coords = Vec::new();
+        for i in 0..=48 {
+            let t = std::f64::consts::PI - theta_top
+                - (i as f64 / 48.0) * (std::f64::consts::PI - 2.0 * theta_top);
+            top_hole_coords.push(Coord {
+                x: cx + r_in * t.cos(),
+                y: cy + r_in * t.sin(),
+            });
+        }
+        top_hole_coords.push(top_hole_coords[0]);
+        let top_hole = LineString::new(top_hole_coords);
+
+        // Two vertical bottom-semicircle cutouts (CW) leaving a 15.2cm central bridge (x in [-0.076, 0.076]).
+        let make_bottom_cutout = |x0: f64, x1: f64| -> LineString<f64> {
+            let y_top = cy - 0.0089;
+            let mut coords = vec![Coord { x: x0, y: y_top }, Coord { x: x1, y: y_top }];
+            let t1 = ((x1 - cx) / r_in).acos();
+            let t0 = ((x0 - cx) / r_in).acos();
+            // Bottom semicircle angles are negative (-t1 .. -t0).
+            for i in 0..=24 {
+                let t = -t1 + (i as f64 / 24.0) * (t1 - t0);
+                coords.push(Coord {
+                    x: cx + r_in * t.cos(),
+                    y: cy + r_in * t.sin(),
+                });
+            }
+            coords.push(Coord { x: x0, y: y_top });
+            LineString::new(coords)
+        };
+        let hole_left = make_bottom_cutout(-0.188, -0.076);
+        let hole_right = make_bottom_cutout(0.076, 0.188);
+
+        let shield = Polygon::new(outer, vec![top_hole, hole_left, hole_right]);
+        let prim = NormalizedPrimitive {
+            id: 0,
+            color_srgb: paint_srgb,
+            opacity: 1.0,
+            geometry: PrimitiveGeom::FilledPolygon(MultiPolygon::new(vec![shield])),
+            gradient_meta: None,
+        };
+
+        let cfg = PlannerConfig::default();
+        let (_job, buf) = rasterize_job_to_canvas(&[prim], &cfg, 1280, 768);
+
+        // Vertical centerline (and +/-1.5cm) of the 15.2cm central bridge must have solid alpha >= 0.80.
+        for step in 0..=20 {
+            let sy = 1.22_f32 + (step as f32 / 20.0) * (1.53_f32 - 1.22_f32);
+            for sx in [-0.015_f32, 0.0_f32, 0.015_f32] {
+                let cov = sample_coverage(&buf, sx, sy, paint_srgb);
+                assert!(
+                    cov >= 0.80,
+                    "unpainted stripe in FCZ central bridge at ({sx:.3}, {sy:.3}): coverage={cov:.3}"
+                );
+            }
+        }
+
+        // Horizontal divider bar and side lobes must also be solidly covered.
+        for &(sx, sy, label) in &[
+            (0.0_f32, 1.563_f32, "horizontal divider center"),
+            (-0.28_f32, 1.40_f32, "left side lobe"),
+            (0.28_f32, 1.40_f32, "right side lobe"),
+        ] {
+            let cov = sample_coverage(&buf, sx, sy, paint_srgb);
+            assert!(
+                cov >= 0.85,
+                "gap at {label} ({sx:.3}, {sy:.3}): coverage={cov:.3}"
+            );
+        }
+
+        // Cutouts must remain clean (bridge medial pass must not bleed across into cutouts).
+        for &(sx, sy, label) in &[
+            (-0.132_f32, 1.44_f32, "left vertical cutout upper"),
+            (-0.132_f32, 1.32_f32, "left vertical cutout lower"),
+            (0.132_f32, 1.44_f32, "right vertical cutout upper"),
+            (0.132_f32, 1.32_f32, "right vertical cutout lower"),
+            (0.0_f32, 1.72_f32, "top semicircle cutout"),
+        ] {
+            let cov = sample_coverage(&buf, sx, sy, paint_srgb);
+            assert!(
+                cov < 0.05,
+                "paint overspray inside {label} ({sx:.3}, {sy:.3}): coverage={cov:.3}"
+            );
+        }
     }
 
     #[test]

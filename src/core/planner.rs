@@ -769,6 +769,99 @@ fn emit_uniform_polyline_stroke(
     emit_polyline_stroke(&pts, standoff, cap, config, out);
 }
 
+/// Computes per-vertex arc-length-smoothed forward unit 2D tangents over a ~0.025m radius window
+/// so sharp corners and boustrophedon turnarounds transition smoothly without wrist snaps.
+fn compute_smoothed_tangents(pts: &[(DVec2, f32)], window_radius: f64) -> Vec<DVec2> {
+    let n = pts.len();
+    let mut s = Vec::with_capacity(n);
+    s.push(0.0_f64);
+    for i in 1..n {
+        s.push(s[i - 1] + pts[i].0.distance(pts[i - 1].0));
+    }
+
+    let seg_dirs: Vec<DVec2> = pts
+        .windows(2)
+        .map(|w| (w[1].0 - w[0].0).normalize_or_zero())
+        .collect();
+
+    let mut tangents = Vec::with_capacity(n);
+    for i in 0..n {
+        let si = s[i];
+        let lo = si - window_radius;
+        let hi = si + window_radius;
+        let mut acc = DVec2::ZERO;
+
+        for (j, &dir) in seg_dirs.iter().enumerate() {
+            let a = s[j];
+            let b = s[j + 1];
+            if b <= lo || a >= hi {
+                continue;
+            }
+            let u0 = (a - si).clamp(-window_radius, window_radius);
+            let u1 = (b - si).clamp(-window_radius, window_radius);
+            if u1 <= u0 {
+                continue;
+            }
+            // Exact integral of tent kernel (1 - |u|/R) over [u0, u1].
+            let weight = (u1 - u0) - (u1 * u1.abs() - u0 * u0.abs()) / (2.0 * window_radius);
+            acc += dir * weight.max(0.0);
+        }
+
+        let unit = if acc.length_squared() > 1e-10 {
+            acc.normalize()
+        } else if i == 0 {
+            seg_dirs[0]
+        } else if i == n - 1 {
+            seg_dirs[seg_dirs.len() - 1]
+        } else {
+            let sum = seg_dirs[i - 1] + seg_dirs[i];
+            if sum.length_squared() > 1e-10 {
+                sum.normalize()
+            } else {
+                seg_dirs[i - 1]
+            }
+        };
+        tangents.push(unit);
+    }
+    tangents
+}
+
+/// Computes a natural human drag-aligned spray aim vector from smoothed 2D stroke tangent `t_xy`,
+/// clamping upward pitch cleanly to keep the can body clear of the canvas wall (`Z = 0`).
+fn compute_drag_aim_dir(t_xy: DVec2, total_len: f64, standoff: f32, cap: NozzleCap) -> Vec3 {
+    let (target_theta, ramp_len, min_cos_phi) = match cap {
+        NozzleCap::Fat => (0.235_f64, 0.045_f64, 0.94_f64),
+        NozzleCap::Skinny => (0.078_f64, 0.025_f64, 0.995_f64),
+    };
+    let len_scale = (total_len / ramp_len).clamp(0.0, 1.0);
+    let theta = target_theta * len_scale;
+    let sin_t = theta.sin();
+
+    // Gentle downward cant (~1.4 deg) when comfortable, scaled with stroke length.
+    let downward_cant = 0.025_f64 * len_scale;
+    let mut dx = t_xy.x * sin_t;
+    let mut dy = t_xy.y * sin_t - downward_cant;
+
+    // Enforce cap-specific cone/stiffness limit (cos_phi >= 0.995 for Skinny, >= 0.94 for Fat).
+    let max_r_xy = (1.0 - min_cos_phi * min_cos_phi).max(0.0).sqrt();
+    let r_xy = dx.hypot(dy);
+    if r_xy > max_r_xy && r_xy > 1e-12 {
+        let scale = max_r_xy / r_xy;
+        dx *= scale;
+        dy *= scale;
+    }
+
+    // Critical clearance clamp: when tilted upward (aim_dir.y > 0), keep can top clear of Z = 0:
+    // standoff - 0.105 * aim_dir.y.max(0.0) - 0.036 >= 0.020 (or clamp positive y to 0 when close).
+    let max_up_y = ((standoff as f64 - 0.036 - 0.020) / 0.105 - 1e-5).max(0.0);
+    if dy > max_up_y {
+        dy = max_up_y;
+    }
+
+    let dz = -(1.0 - dx * dx - dy * dy).max(0.0).sqrt();
+    Vec3::new(dx as f32, dy as f32, dz as f32).normalize_or(Vec3::NEG_Z)
+}
+
 /// Wraps a continuous 2D path with per-point opacity scales and tangential lead-in/lead-out
 /// (`valve_on = false`), emitting a [`JobOp::PaintStroke`].
 fn emit_polyline_stroke(
@@ -800,15 +893,16 @@ fn emit_polyline_stroke(
         return;
     }
 
+    let tangents = compute_smoothed_tangents(&pts, 0.025);
     let feed_speed = compensated_feed_speed_cap(config, cap, standoff);
     let lead = config.lead_length as f64;
     let lead_in_pt = pts[0].0 - start_dir * lead;
     let lead_out_pt = pts[pts.len() - 1].0 + end_dir * lead;
 
-    let make_wp = |p: DVec2, opacity_scale: f32, valve_on: bool| StrokeWaypoint {
+    let make_wp = |p: DVec2, t_xy: DVec2, opacity_scale: f32, valve_on: bool| StrokeWaypoint {
         pos: Vec3::new(p.x as f32, p.y as f32, 0.0),
         normal: Vec3::Z,
-        aim_dir: Vec3::NEG_Z,
+        aim_dir: compute_drag_aim_dir(t_xy, total_len, standoff, cap),
         standoff,
         feed_speed,
         valve_on,
@@ -817,11 +911,16 @@ fn emit_polyline_stroke(
     };
 
     let mut waypoints = Vec::with_capacity(pts.len() + 2);
-    waypoints.push(make_wp(lead_in_pt, pts[0].1, false));
-    for &(p, op) in &pts {
-        waypoints.push(make_wp(p, op, true));
+    waypoints.push(make_wp(lead_in_pt, tangents[0], pts[0].1, false));
+    for (&(p, op), &t_xy) in pts.iter().zip(tangents.iter()) {
+        waypoints.push(make_wp(p, t_xy, op, true));
     }
-    waypoints.push(make_wp(lead_out_pt, pts[pts.len() - 1].1, false));
+    waypoints.push(make_wp(
+        lead_out_pt,
+        tangents[tangents.len() - 1],
+        pts[pts.len() - 1].1,
+        false,
+    ));
 
     out.push(JobOp::PaintStroke {
         points_canvas_3d: waypoints,
@@ -1265,5 +1364,239 @@ mod tests {
             }
         }
         assert!(held_slot.is_none());
+    }
+
+    #[test]
+    fn fat_hatch_stroke_emits_drag_aligned_aim_dir() {
+        let cfg = PlannerConfig::default();
+        let mut out = Vec::new();
+        emit_uniform_polyline_stroke(
+            &[DVec2::new(-0.20, 1.50), DVec2::new(0.20, 1.50)],
+            0.14,
+            1.0,
+            NozzleCap::Fat,
+            &cfg,
+            &mut out,
+        );
+        let JobOp::PaintStroke { points_canvas_3d: wps } = &out[0] else {
+            panic!("expected PaintStroke");
+        };
+        assert_eq!(wps.len(), 4);
+        // Lead-in and lead-out smoothly inherit start/end tangents.
+        assert!((wps[0].aim_dir - wps[1].aim_dir).length() < 1e-6);
+        assert!((wps[3].aim_dir - wps[2].aim_dir).length() < 1e-6);
+
+        for wp in wps {
+            let xy_mag = wp.aim_dir.truncate().length();
+            assert!(xy_mag > 0.15, "Fat drag tilt xy mag {xy_mag} should exceed 0.15");
+            assert!(wp.aim_dir.z < -0.95, "Fat aim_dir.z {} should be < -0.95", wp.aim_dir.z);
+            assert!(wp.aim_dir.x > 0.15, "aim_dir.x {} should align with +X drag", wp.aim_dir.x);
+            assert!((wp.aim_dir.length() - 1.0).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn skinny_detail_stroke_emits_subtle_tilt_and_respects_clearance_clamp() {
+        let cfg = PlannerConfig::default();
+        let mut out = Vec::new();
+        emit_uniform_polyline_stroke(
+            &[DVec2::new(-0.04, 1.50), DVec2::new(0.04, 1.50)],
+            0.045,
+            1.0,
+            NozzleCap::Skinny,
+            &cfg,
+            &mut out,
+        );
+        let JobOp::PaintStroke { points_canvas_3d: wps } = &out[0] else {
+            panic!("expected PaintStroke");
+        };
+        for wp in wps {
+            let xy_mag = wp.aim_dir.truncate().length();
+            assert!(
+                xy_mag > 0.04 && xy_mag <= 0.11,
+                "Skinny xy tilt {xy_mag} out of (0.04, 0.11]"
+            );
+            assert!(wp.aim_dir.z < -0.99, "Skinny aim_dir.z {} should be < -0.99", wp.aim_dir.z);
+            assert!(wp.aim_dir.z <= -0.995 + 1e-5, "Skinny cos_phi should stay >= 0.995");
+        }
+
+        // Upward close Skinny pass (standoff = 0.038m) must clamp positive aim_dir.y <= 0.0.
+        let mut close_up = Vec::new();
+        emit_uniform_polyline_stroke(
+            &[DVec2::new(0.0, 1.45), DVec2::new(0.0, 1.55)],
+            0.038,
+            1.0,
+            NozzleCap::Skinny,
+            &cfg,
+            &mut close_up,
+        );
+        let JobOp::PaintStroke { points_canvas_3d: close_wps } = &close_up[0] else {
+            panic!("expected PaintStroke");
+        };
+        for wp in close_wps {
+            assert!(
+                wp.aim_dir.y <= 1e-6,
+                "close upward Skinny pass must clamp positive aim_dir.y, got {}",
+                wp.aim_dir.y
+            );
+            assert!(wp.nozzle_pos().z >= 0.03);
+        }
+
+        // Marginal standoff (0.065m) upward pass must satisfy standoff - 0.105 * y - 0.036 >= 0.020.
+        let mut mid_up = Vec::new();
+        emit_uniform_polyline_stroke(
+            &[DVec2::new(0.0, 1.45), DVec2::new(0.0, 1.55)],
+            0.065,
+            1.0,
+            NozzleCap::Fat,
+            &cfg,
+            &mut mid_up,
+        );
+        let JobOp::PaintStroke { points_canvas_3d: mid_wps } = &mid_up[0] else {
+            panic!("expected PaintStroke");
+        };
+        for wp in mid_wps {
+            let clearance = wp.standoff - 0.105 * wp.aim_dir.y.max(0.0) - 0.036;
+            assert!(
+                clearance >= 0.020 - 1e-5,
+                "can-top clearance {clearance} fell below 0.020m"
+            );
+        }
+    }
+
+    #[test]
+    fn sharp_90_deg_corner_stroke_smooths_aim_dir_transition() {
+        let cfg = PlannerConfig::default();
+        // 3-point sharp 90 deg corner (+X then +Y).
+        let mut out_sparse = Vec::new();
+        emit_uniform_polyline_stroke(
+            &[
+                DVec2::new(0.0, 1.40),
+                DVec2::new(0.20, 1.40),
+                DVec2::new(0.20, 1.60),
+            ],
+            0.12,
+            1.0,
+            NozzleCap::Fat,
+            &cfg,
+            &mut out_sparse,
+        );
+        let JobOp::PaintStroke { points_canvas_3d: wps } = &out_sparse[0] else {
+            panic!("expected PaintStroke");
+        };
+        // Active corner vertex at index 2 should smoothly bisect (+X, +Y).
+        let corner_xy = wps[2].aim_dir.truncate().normalize();
+        assert!(
+            corner_xy.x > 0.55 && corner_xy.y > 0.55,
+            "corner vertex should blend both legs smoothly, got {:?}",
+            wps[2].aim_dir
+        );
+        for pair in wps.windows(2) {
+            let xy_a = pair[0].aim_dir.truncate().normalize();
+            let xy_b = pair[1].aim_dir.truncate().normalize();
+            let angle_deg = xy_a.dot(xy_b).clamp(-1.0, 1.0).acos().to_degrees();
+            assert!(
+                angle_deg < 55.0,
+                "90-deg corner snapped by {angle_deg:.1} deg in a single step"
+            );
+        }
+
+        // Dense 90 deg corner (8mm spacing) transitions gradually over the ~0.025m window.
+        let mut dense_pts = Vec::new();
+        for i in 0..=15 {
+            dense_pts.push(DVec2::new(i as f64 * 0.008, 1.40));
+        }
+        for i in 1..=15 {
+            dense_pts.push(DVec2::new(0.12, 1.40 + i as f64 * 0.008));
+        }
+        let mut out_dense = Vec::new();
+        emit_uniform_polyline_stroke(&dense_pts, 0.12, 1.0, NozzleCap::Fat, &cfg, &mut out_dense);
+        let JobOp::PaintStroke { points_canvas_3d: dense_wps } = &out_dense[0] else {
+            panic!("expected PaintStroke");
+        };
+        for pair in dense_wps.windows(2) {
+            let step_deg = pair[0]
+                .aim_dir
+                .dot(pair[1].aim_dir)
+                .clamp(-1.0, 1.0)
+                .acos()
+                .to_degrees();
+            assert!(
+                step_deg < 8.0,
+                "dense corner aim_dir jumped {step_deg:.2} deg between adjacent vertices"
+            );
+            let xy_a = pair[0].aim_dir.truncate().normalize();
+            let xy_b = pair[1].aim_dir.truncate().normalize();
+            let xy_step_deg = xy_a.dot(xy_b).clamp(-1.0, 1.0).acos().to_degrees();
+            assert!(
+                xy_step_deg < 40.0,
+                "dense corner XY tilt jumped {xy_step_deg:.2} deg between adjacent vertices"
+            );
+        }
+    }
+
+    #[test]
+    fn poster_strokes_preserve_drag_tilt_and_nozzle_z_clearance() {
+        let cfg = PlannerConfig::default();
+        let prims = ingest_svg_file(
+            Path::new("assets/examples/02_street_art_poster.svg"),
+            &IngestConfig::default(),
+        )
+        .expect("ingest 02_street_art_poster");
+        let palette = quantize_palette(&prims, 16, 42);
+        let batches = batch_primitives(&prims, &palette, &BatchConfig::default());
+        let job = plan_job(&prims, &palette, &batches, &cfg);
+
+        let mut saw_tilted_fat = false;
+        let mut saw_tilted_skinny = false;
+        for op in &job.ops {
+            if let JobOp::PaintStroke { points_canvas_3d } = op {
+                for wp in points_canvas_3d {
+                    assert!(
+                        (wp.aim_dir.length() - 1.0).abs() < 1e-5,
+                        "aim_dir must be normalized: {:?}",
+                        wp.aim_dir
+                    );
+                    assert!(
+                        wp.aim_dir.z <= -0.94 + 1e-5,
+                        "aim_dir.z {} violated <= -0.94 bound",
+                        wp.aim_dir.z
+                    );
+                    let noz = wp.nozzle_pos();
+                    assert!(
+                        noz.z >= 0.03,
+                        "nozzle_pos.z {} fell below 0.03m (standoff={}, aim={:?})",
+                        noz.z,
+                        wp.standoff,
+                        wp.aim_dir
+                    );
+                    if wp.standoff >= 0.056 {
+                        let clearance = wp.standoff - 0.105 * wp.aim_dir.y.max(0.0) - 0.036;
+                        assert!(
+                            clearance >= 0.020 - 1e-5,
+                            "can-top clearance {clearance} < 0.020 at standoff={}",
+                            wp.standoff
+                        );
+                    } else {
+                        assert!(
+                            wp.aim_dir.y <= 1e-5,
+                            "close pass (standoff={}) had positive aim_dir.y={}",
+                            wp.standoff,
+                            wp.aim_dir.y
+                        );
+                    }
+                    let xy_mag = wp.aim_dir.truncate().length();
+                    match wp.cap {
+                        NozzleCap::Fat if xy_mag > 0.15 => saw_tilted_fat = true,
+                        NozzleCap::Skinny if xy_mag > 0.04 && xy_mag <= 0.11 => {
+                            saw_tilted_skinny = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert!(saw_tilted_fat, "expected tilted Fat strokes in poster job");
+        assert!(saw_tilted_skinny, "expected tilted Skinny strokes in poster job");
     }
 }

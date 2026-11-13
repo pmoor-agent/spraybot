@@ -267,6 +267,62 @@ pub fn is_video_file_path(path: &Path) -> bool {
         })
 }
 
+/// Supported `ffmpeg` video encoders in preference order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FfmpegVideoEncoder {
+    Libx264,
+    Libopenh264,
+    Mpeg4,
+}
+
+impl FfmpegVideoEncoder {
+    /// Parses `ffmpeg -hide_banner -encoders` output and selects the best available encoder.
+    pub fn select_from_encoders_list(encoders_output: &str) -> Self {
+        let has_token = |needle: &str| {
+            encoders_output
+                .lines()
+                .any(|line| line.split_whitespace().any(|tok| tok == needle))
+        };
+        if has_token("libx264") {
+            Self::Libx264
+        } else if has_token("libopenh264") {
+            Self::Libopenh264
+        } else {
+            Self::Mpeg4
+        }
+    }
+
+    /// Probes the host `ffmpeg` binary for supported video encoders (cached once per process).
+    pub fn detect() -> Self {
+        static DETECTED: std::sync::OnceLock<FfmpegVideoEncoder> = std::sync::OnceLock::new();
+        *DETECTED.get_or_init(|| {
+            match Command::new("ffmpeg")
+                .args(["-hide_banner", "-encoders"])
+                .output()
+            {
+                Ok(out) => {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    Self::select_from_encoders_list(&text)
+                }
+                Err(_) => Self::Libx264,
+            }
+        })
+    }
+
+    /// Returns the `ffmpeg` codec arguments for this encoder.
+    pub fn codec_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Libx264 => &[
+                "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
+            ],
+            Self::Libopenh264 => &[
+                "-c:v", "libopenh264", "-b:v", "10M", "-pix_fmt", "yuv420p",
+            ],
+            Self::Mpeg4 => &["-c:v", "mpeg4", "-q:v", "3", "-pix_fmt", "yuv420p"],
+        }
+    }
+}
+
 /// Destination sink for tightly packed RGBA8 frames.
 enum VideoSink {
     Ffmpeg {
@@ -296,32 +352,31 @@ impl VideoSink {
                 })?;
             }
 
-            let mut child = Command::new("ffmpeg")
-                .args([
-                    "-y",
-                    "-f",
-                    "rawvideo",
-                    "-pix_fmt",
-                    "rgba",
-                    "-s",
-                    &format!("{width}x{height}"),
-                    "-r",
-                    &fps.to_string(),
-                    "-i",
-                    "-",
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "medium",
-                    "-crf",
-                    "18",
-                    "-pix_fmt",
-                    "yuv420p",
-                ])
-                .arg(output)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
+            let encoder = FfmpegVideoEncoder::detect();
+            let size_arg = format!("{width}x{height}");
+            let fps_arg = fps.to_string();
+
+            let mut cmd = Command::new("ffmpeg");
+            cmd.args([
+                "-y",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgba",
+                "-s",
+                &size_arg,
+                "-r",
+                &fps_arg,
+                "-i",
+                "-",
+            ])
+            .args(encoder.codec_args())
+            .arg(output)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+
+            let mut child = cmd
                 .spawn()
                 .map_err(|err| format!("failed to spawn ffmpeg for '{}': {err}", output.display()))?;
 
@@ -339,7 +394,7 @@ impl VideoSink {
             });
 
             info!(
-                "Recording {width}x{height} @ {fps}fps MP4/video stream to {}",
+                "Recording {width}x{height} @ {fps}fps video ({encoder:?}) to {}",
                 output.display()
             );
 
@@ -836,5 +891,21 @@ mod tests {
         assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn selects_best_available_ffmpeg_h264_encoder() {
+        assert_eq!(
+            FfmpegVideoEncoder::select_from_encoders_list(" V....D libx264 \n V....D libopenh264 \n"),
+            FfmpegVideoEncoder::Libx264
+        );
+        assert_eq!(
+            FfmpegVideoEncoder::select_from_encoders_list(" V....D libopenh264 OpenH264 \n V.S..D mpeg4 \n"),
+            FfmpegVideoEncoder::Libopenh264
+        );
+        assert_eq!(
+            FfmpegVideoEncoder::select_from_encoders_list(" V.S..D mpeg4 \n"),
+            FfmpegVideoEncoder::Mpeg4
+        );
     }
 }

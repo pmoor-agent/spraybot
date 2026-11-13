@@ -6,6 +6,8 @@ use bevy::light::{NotShadowCaster, NotShadowReceiver};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
+use crate::core::types::NozzleCap;
+#[cfg(test)]
 use crate::sim::canvas::CONE_HALF_ANGLE_RAD;
 use crate::sim::state::{AppConfig, SimClock, SimStepSet, SprayJobRes};
 
@@ -219,6 +221,12 @@ fn update_mist(
     // On large timelapse steps, pre-age puffs slightly along the cone so the plume looks continuous.
     let pre_age_max = (dt_sim * 0.5).min(0.08);
     let pool_len = mist_state.entities.len();
+    let cone_half_angle = frame.active_cap.cone_half_angle_rad();
+    let (size_scale, alpha_scale) = if frame.active_cap == NozzleCap::Skinny {
+        (0.48_f32, 0.80_f32)
+    } else {
+        (1.0_f32, 1.0_f32)
+    };
 
     for i in 0..spawn_count {
         let mut spawned = false;
@@ -228,7 +236,7 @@ fn update_mist(
             if let Ok((mut p, mut tf, mut vis)) = particle_q.get_mut(entity)
                 && (!p.active || attempt + 1 == pool_len)
             {
-                let emit_dir = sample_cone_direction(nozzle_dir, CONE_HALF_ANGLE_RAD, &mut mist_state.rng);
+                let emit_dir = sample_cone_direction(nozzle_dir, cone_half_angle, &mut mist_state.rng);
                 let speed = mist_state.rng.range(1.65, 2.55);
                 let lifetime = mist_state.rng.range(0.18, 0.35);
                 let initial_age = if dt_sim > 0.04 {
@@ -242,10 +250,11 @@ fn update_mist(
                 p.lifetime = lifetime;
                 p.pos = nozzle_pos + emit_dir * mist_state.rng.range(0.004, 0.016);
                 p.vel = emit_dir * speed;
-                p.start_size = mist_state.rng.range(0.014, 0.022);
-                p.end_size = mist_state.rng.range(0.060, 0.092);
+                p.start_size = mist_state.rng.range(0.014, 0.022) * size_scale;
+                p.end_size = mist_state.rng.range(0.060, 0.092) * size_scale;
                 p.color_srgb = can_srgb;
-                p.base_alpha = mist_state.rng.range(0.16, 0.28) * frame.flow_scale.clamp(0.35, 1.0);
+                p.base_alpha =
+                    mist_state.rng.range(0.16, 0.28) * frame.flow_scale.clamp(0.35, 1.0) * alpha_scale;
                 p.roll = mist_state.rng.range(0.0, 2.0 * PI);
                 p.roll_vel = mist_state.rng.range(-2.5, 2.5);
 

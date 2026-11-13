@@ -2,11 +2,12 @@ use std::f32::consts::FRAC_PI_2;
 
 use bevy::prelude::*;
 
-use crate::core::types::RackSlotPose;
+use crate::core::types::{NozzleCap, RackSlotPose};
 use crate::sim::state::{AppConfig, SprayJobRes};
 
 pub fn plugin(app: &mut App) {
     app.init_resource::<HeldCanSlot>()
+        .init_resource::<SlotCapVisualState>()
         .init_resource::<StudioRackCache>()
         .add_systems(Startup, spawn_robot_and_cans);
 }
@@ -33,9 +34,20 @@ pub struct CanEntity {
     pub slot: usize,
 }
 
+/// Identifies a switchable nozzle cap visual group attached to a [`CanEntity`].
+#[derive(Component, Debug, Clone, Copy)]
+pub struct CanCapVisual {
+    pub slot: usize,
+    pub cap: NozzleCap,
+}
+
 /// Tracks which rack slot's spray can is currently held by the gripper.
 #[derive(Resource, Debug, Default, Clone, Copy)]
 pub struct HeldCanSlot(pub Option<usize>);
+
+/// Tracks the currently mounted nozzle cap visual state for each rack slot.
+#[derive(Resource, Debug, Default, Clone)]
+pub struct SlotCapVisualState(pub Vec<NozzleCap>);
 
 /// Cached rack slot poses computed from [`StudioConfig`] at startup.
 #[derive(Resource, Debug, Default, Clone)]
@@ -65,6 +77,7 @@ fn spawn_robot_and_cans(
     app_config: Res<AppConfig>,
     spray_job: Res<SprayJobRes>,
     mut held_can: ResMut<HeldCanSlot>,
+    mut slot_caps: ResMut<SlotCapVisualState>,
     mut rack_cache: ResMut<StudioRackCache>,
 ) {
     let studio = &app_config.studio;
@@ -76,6 +89,12 @@ fn spawn_robot_and_cans(
 
     let frame = &spray_job.current_frame;
     held_can.0 = frame.held_can_slot;
+    slot_caps.0 = vec![NozzleCap::Fat; max_slots];
+    if let Some(slot) = frame.held_can_slot
+        && let Some(entry) = slot_caps.0.get_mut(slot)
+    {
+        *entry = frame.active_cap;
+    }
 
     let link_xforms = spray_job.chain.fk_links(&frame.joints);
     let grasp_xform = spray_job.chain.fk_grasp(&frame.joints);
@@ -482,6 +501,18 @@ fn spawn_robot_and_cans(
         perceptual_roughness: 0.65,
         ..default()
     });
+    let cyan_cap_mat = materials.add(StandardMaterial {
+        base_color: Srgba::hex("#00E5FF").unwrap().into(),
+        metallic: 0.08,
+        perceptual_roughness: 0.36,
+        ..default()
+    });
+    let needle_metal_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.84, 0.87, 0.91),
+        metallic: 0.94,
+        perceptual_roughness: 0.16,
+        ..default()
+    });
 
     let bottom_rim_mesh = meshes.add(Cylinder::new(0.033, 0.010));
     let body_mesh = meshes.add(Cylinder::new(0.0328, 0.122));
@@ -498,6 +529,9 @@ fn spawn_robot_and_cans(
     let cap_collar_mesh = meshes.add(Cylinder::new(0.020, 0.024));
     let nozzle_button_mesh = meshes.add(Cylinder::new(0.0085, 0.018));
     let nozzle_tip_mesh = meshes.add(Cylinder::new(0.0032, 0.014));
+    let skinny_button_mesh = meshes.add(Cylinder::new(0.0080, 0.019));
+    let skinny_collar_mesh = meshes.add(Cylinder::new(0.0096, 0.005));
+    let skinny_needle_mesh = meshes.add(Cylinder::new(0.0014, 0.015));
 
     for can in &spray_job.palette.cans {
         let can_color = Color::srgb_u8(can.color_srgb[0], can.color_srgb[1], can.color_srgb[2]);
@@ -528,6 +562,18 @@ fn spawn_robot_and_cans(
             }
         } else {
             Transform::IDENTITY
+        };
+
+        let slot_cap = slot_caps.0.get(can.slot_index).copied().unwrap_or_default();
+        let fat_vis = if slot_cap == NozzleCap::Fat {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        let skinny_vis = if slot_cap == NozzleCap::Skinny {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
         };
 
         commands.spawn((
@@ -567,18 +613,54 @@ fn spawn_robot_and_cans(
                     MeshMaterial3d(cap_mat),
                     Transform::from_xyz(0.0, 0.078, 0.0),
                 ),
-                // White actuator button
+                // Switchable Fat cap visual group (white wide actuator button + dark fat orifice)
                 (
-                    Mesh3d(nozzle_button_mesh.clone()),
-                    MeshMaterial3d(white_nozzle_mat.clone()),
-                    Transform::from_xyz(0.0, 0.089, 0.0),
+                    CanCapVisual {
+                        slot: can.slot_index,
+                        cap: NozzleCap::Fat,
+                    },
+                    Transform::IDENTITY,
+                    fat_vis,
+                    children![
+                        (
+                            Mesh3d(nozzle_button_mesh.clone()),
+                            MeshMaterial3d(white_nozzle_mat.clone()),
+                            Transform::from_xyz(0.0, 0.089, 0.0),
+                        ),
+                        (
+                            Mesh3d(nozzle_tip_mesh.clone()),
+                            MeshMaterial3d(orifice_mat.clone()),
+                            Transform::from_xyz(0.0, 0.085, -0.009)
+                                .with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
+                        ),
+                    ],
                 ),
-                // Forward spray orifice tip matching kinematics::nozzle_local_pos (0, 0.085, -0.015)
+                // Switchable Skinny cap visual group (cyan stencil cap + fine metallic needle orifice)
                 (
-                    Mesh3d(nozzle_tip_mesh.clone()),
-                    MeshMaterial3d(orifice_mat.clone()),
-                    Transform::from_xyz(0.0, 0.085, -0.009)
-                        .with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
+                    CanCapVisual {
+                        slot: can.slot_index,
+                        cap: NozzleCap::Skinny,
+                    },
+                    Transform::IDENTITY,
+                    skinny_vis,
+                    children![
+                        (
+                            Mesh3d(skinny_button_mesh.clone()),
+                            MeshMaterial3d(cyan_cap_mat.clone()),
+                            Transform::from_xyz(0.0, 0.0895, 0.0),
+                        ),
+                        (
+                            Mesh3d(skinny_collar_mesh.clone()),
+                            MeshMaterial3d(cyan_cap_mat.clone()),
+                            Transform::from_xyz(0.0, 0.082, 0.0),
+                        ),
+                        (
+                            Mesh3d(skinny_needle_mesh.clone()),
+                            MeshMaterial3d(needle_metal_mat.clone()),
+                            Transform::from_xyz(0.0, 0.085, -0.010)
+                                .with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
+                        ),
+                    ],
                 ),
             ],
         ));

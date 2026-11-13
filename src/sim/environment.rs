@@ -13,6 +13,7 @@ use bevy::{
     },
 };
 
+use crate::core::types::StudioConfig;
 use crate::sim::state::AppConfig;
 
 pub fn plugin(app: &mut App) {
@@ -626,13 +627,231 @@ fn spawn_spray_can_rack(
         ));
         parent.spawn((
             Mesh3d(brace_mesh),
-            MeshMaterial3d(rack_steel_mat),
+            MeshMaterial3d(rack_steel_mat.clone()),
             Transform::from_xyz(0.0, 0.72, -studio.rack_tier_step_n - 0.025),
         ));
+
+        // Side-of-rack pneumatic Cap-Swap Station bolted onto the right (+t_rack) upright
+        spawn_cap_swap_station(
+            parent,
+            meshes,
+            materials,
+            studio,
+            max_cans,
+            half_w,
+            rack_steel_mat,
+        );
     });
 
     // Subtle slot number verification: ensure every slot from StudioConfig sits above a shelf
     debug_assert_eq!(slots.len(), max_cans);
+}
+
+#[inline]
+fn cap_dock_nozzle_world(dock: &crate::core::types::CapDockPose) -> Vec3 {
+    dock.grasp_pos + dock.grasp_rot * Vec3::new(0.0, 0.085, -0.015)
+}
+
+fn spawn_cap_swap_station(
+    parent: &mut ChildSpawnerCommands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<StandardMaterial>>,
+    studio: &StudioConfig,
+    max_cans: usize,
+    rack_half_w: f32,
+    gunmetal_mat: Handle<StandardMaterial>,
+) {
+    let cap_docks = studio.cap_station_poses(max_cans);
+    let rack_origin = Vec3::new(studio.rack_center_xz.x, 0.0, studio.rack_center_xz.z);
+    let rack_rot_inv = Quat::from_rotation_y(studio.rack_yaw_deg.to_radians()).inverse();
+
+    let dock0_nozzle = rack_rot_inv * (cap_dock_nozzle_world(&cap_docks[0]) - rack_origin);
+    let dock1_nozzle = rack_rot_inv * (cap_dock_nozzle_world(&cap_docks[1]) - rack_origin);
+
+    let aluminum_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.76, 0.79, 0.83),
+        metallic: 0.90,
+        perceptual_roughness: 0.24,
+        ..default()
+    });
+    let safety_orange_mat = materials.add(StandardMaterial {
+        base_color: Srgba::hex("#E85D1A").unwrap().into(),
+        metallic: 0.14,
+        perceptual_roughness: 0.34,
+        ..default()
+    });
+    let dark_socket_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.07, 0.08, 0.09),
+        metallic: 0.45,
+        perceptual_roughness: 0.55,
+        ..default()
+    });
+    let white_cap_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.95, 0.95, 0.94),
+        metallic: 0.02,
+        perceptual_roughness: 0.38,
+        ..default()
+    });
+    let cyan_cap_mat = materials.add(StandardMaterial {
+        base_color: Srgba::hex("#00E5FF").unwrap().into(),
+        metallic: 0.12,
+        perceptual_roughness: 0.32,
+        ..default()
+    });
+    let brass_fitting_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.80, 0.64, 0.28),
+        metallic: 0.88,
+        perceptual_roughness: 0.28,
+        ..default()
+    });
+
+    // 1. Welded gunmetal cantilever bracket bolted onto the right (+t_rack) rear upright
+    let x_upright_outer = rack_half_w + 0.006;
+    let x_station_outer = dock1_nozzle.x + 0.042;
+    let beam_w = (x_station_outer - x_upright_outer).max(0.18);
+    let beam_cx = 0.5 * (x_upright_outer + x_station_outer);
+    let rear_z = -studio.rack_tier_step_n - 0.025;
+
+    // Upright clamp flange plate
+    parent.spawn((
+        Mesh3d(meshes.add(Cuboid::new(0.012, 0.145, 0.062))),
+        MeshMaterial3d(gunmetal_mat.clone()),
+        Transform::from_xyz(x_upright_outer + 0.004, 1.078, rear_z + 0.006),
+    ));
+    // Horizontal cantilevered steel box beam
+    parent.spawn((
+        Mesh3d(meshes.add(Cuboid::new(beam_w, 0.026, 0.040))),
+        MeshMaterial3d(gunmetal_mat.clone()),
+        Transform::from_xyz(beam_cx, 1.084, -0.044),
+    ));
+    // Angled welded diagonal gusset strut beneath the cantilever beam
+    parent.spawn((
+        Mesh3d(meshes.add(Cuboid::new(0.145, 0.018, 0.024))),
+        MeshMaterial3d(gunmetal_mat.clone()),
+        Transform::from_xyz(x_upright_outer + 0.068, 1.036, -0.046)
+            .with_rotation(Quat::from_rotation_z(0.58)),
+    ));
+    // Outboard end plate
+    parent.spawn((
+        Mesh3d(meshes.add(Cuboid::new(0.008, 0.056, 0.068))),
+        MeshMaterial3d(gunmetal_mat.clone()),
+        Transform::from_xyz(x_station_outer + 0.004, 1.110, -0.024),
+    ));
+
+    // 2. Brushed aluminum pneumatic manifold block (kept strictly at z <= +0.012 so can body at z >= +0.027 clears)
+    let manifold_x0 = (dock0_nozzle.x - 0.068).max(x_upright_outer + 0.012);
+    let manifold_x1 = x_station_outer;
+    let manifold_w = (manifold_x1 - manifold_x0).max(0.16);
+    let manifold_cx = 0.5 * (manifold_x0 + manifold_x1);
+
+    parent.spawn((
+        Mesh3d(meshes.add(Cuboid::new(manifold_w, 0.042, 0.060))),
+        MeshMaterial3d(aluminum_mat.clone()),
+        Transform::from_xyz(manifold_cx, 1.116, -0.020),
+    ));
+
+    // Brass pneumatic air-line fittings on rear face of manifold
+    let fitting_mesh = meshes.add(Cylinder::new(0.0055, 0.014));
+    for dx in [-0.040_f32, 0.040] {
+        parent.spawn((
+            Mesh3d(fitting_mesh.clone()),
+            MeshMaterial3d(brass_fitting_mat.clone()),
+            Transform::from_xyz(manifold_cx + dx, 1.116, -0.056)
+                .with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
+        ));
+    }
+
+    // 3. Safety-orange front fascia bar across manifold front (+n_rack face, z <= +0.018)
+    parent.spawn((
+        Mesh3d(meshes.add(Cuboid::new(manifold_w + 0.006, 0.018, 0.008))),
+        MeshMaterial3d(safety_orange_mat),
+        Transform::from_xyz(manifold_cx, 1.114, 0.014),
+    ));
+
+    // 4. Pneumatic cap-extractor collet cups + color-coded ring collars + spare cap magazines
+    let collet_arm_mesh = meshes.add(Cuboid::new(0.016, 0.008, 0.038));
+    let collet_cup_mesh = meshes.add(Cylinder::new(0.0095, 0.009));
+    let collet_bore_mesh = meshes.add(Cylinder::new(0.0062, 0.002));
+    let collar_ring_mesh = meshes.add(Cylinder::new(0.0118, 0.003));
+    let spare_socket_mesh = meshes.add(Cylinder::new(0.0096, 0.003));
+    let spare_fat_body_mesh = meshes.add(Cylinder::new(0.0082, 0.015));
+    let spare_fat_tip_mesh = meshes.add(Cylinder::new(0.0028, 0.006));
+    let spare_skinny_body_mesh = meshes.add(Cylinder::new(0.0078, 0.016));
+    let spare_skinny_needle_mesh = meshes.add(Cylinder::new(0.0014, 0.008));
+
+    let dock_specs = [
+        (dock0_nozzle, white_cap_mat.clone(), true),
+        (dock1_nozzle, cyan_cap_mat.clone(), false),
+    ];
+
+    for (nozzle_local, accent_mat, is_fat) in dock_specs {
+        let y_cup = nozzle_local.y - 0.004;
+
+        // Slim cantilevered extractor arm from manifold front (z = 0.008) to nozzle tip (z = nozzle_local.z)
+        let arm_z_start = 0.008;
+        let arm_z_mid = 0.5 * (arm_z_start + nozzle_local.z);
+        parent.spawn((
+            Mesh3d(collet_arm_mesh.clone()),
+            MeshMaterial3d(aluminum_mat.clone()),
+            Transform::from_xyz(nozzle_local.x, y_cup - 0.005, arm_z_mid),
+        ));
+
+        // Pneumatic cap-extractor collet cup cleanly below/around nozzle tip with open top socket
+        parent.spawn((
+            Mesh3d(collet_cup_mesh.clone()),
+            MeshMaterial3d(gunmetal_mat.clone()),
+            Transform::from_xyz(nozzle_local.x, y_cup, nozzle_local.z),
+        ));
+        parent.spawn((
+            Mesh3d(collet_bore_mesh.clone()),
+            MeshMaterial3d(dark_socket_mat.clone()),
+            Transform::from_xyz(nozzle_local.x, y_cup + 0.0042, nozzle_local.z),
+        ));
+
+        // Color-coded identification ring collar around the dock collet cup
+        parent.spawn((
+            Mesh3d(collar_ring_mesh.clone()),
+            MeshMaterial3d(accent_mat.clone()),
+            Transform::from_xyz(nozzle_local.x, y_cup + 0.0015, nozzle_local.z),
+        ));
+
+        // 3 spare caps arranged neatly on the manifold rear magazine shelf beside/behind each dock
+        let magazine_y = 1.1385;
+        let magazine_z = -0.024;
+        for offset_x in [-0.020_f32, 0.0, 0.020] {
+            let cx = nozzle_local.x + offset_x;
+            parent.spawn((
+                Mesh3d(spare_socket_mesh.clone()),
+                MeshMaterial3d(dark_socket_mat.clone()),
+                Transform::from_xyz(cx, magazine_y, magazine_z),
+            ));
+            if is_fat {
+                parent.spawn((
+                    Mesh3d(spare_fat_body_mesh.clone()),
+                    MeshMaterial3d(accent_mat.clone()),
+                    Transform::from_xyz(cx, magazine_y + 0.0085, magazine_z),
+                ));
+                parent.spawn((
+                    Mesh3d(spare_fat_tip_mesh.clone()),
+                    MeshMaterial3d(dark_socket_mat.clone()),
+                    Transform::from_xyz(cx, magazine_y + 0.011, magazine_z - 0.007)
+                        .with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
+                ));
+            } else {
+                parent.spawn((
+                    Mesh3d(spare_skinny_body_mesh.clone()),
+                    MeshMaterial3d(accent_mat.clone()),
+                    Transform::from_xyz(cx, magazine_y + 0.009, magazine_z),
+                ));
+                parent.spawn((
+                    Mesh3d(spare_skinny_needle_mesh.clone()),
+                    MeshMaterial3d(aluminum_mat.clone()),
+                    Transform::from_xyz(cx, magazine_y + 0.011, magazine_z - 0.008)
+                        .with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
+                ));
+            }
+        }
+    }
 }
 
 fn spawn_studio_lights(
@@ -1087,6 +1306,25 @@ mod tests {
         assert_eq!(f32_to_f16_bits(0.0), 0x0000);
         assert_eq!(f32_to_f16_bits(1.0), 0x3c00);
         assert_eq!(f32_to_f16_bits(8.0), 0x4800);
+    }
+
+    #[test]
+    fn cap_station_collet_cups_align_below_nozzle_tip_and_clear_rack() {
+        let studio = StudioConfig::default();
+        let docks = studio.cap_station_poses(16);
+        let rack_origin = Vec3::new(studio.rack_center_xz.x, 0.0, studio.rack_center_xz.z);
+        let rack_rot_inv = Quat::from_rotation_y(studio.rack_yaw_deg.to_radians()).inverse();
+        let rack_half_w = (8.0 * studio.rack_slot_spacing + 0.070) * 0.5;
+
+        for dock in &docks {
+            let nozzle_world = cap_dock_nozzle_world(dock);
+            let nozzle_local = rack_rot_inv * (nozzle_world - rack_origin);
+            let y_cup = nozzle_local.y - 0.004;
+            assert!((y_cup - (nozzle_world.y - 0.004)).abs() < 1e-5);
+            // Manifold front fascia sits at z = 0.018, can body at dock sits at z >= 0.060 - 0.033 = 0.027
+            assert!(nozzle_local.z - 0.027 > 0.010);
+            assert!(nozzle_local.x > rack_half_w + 0.05);
+        }
     }
 }
 

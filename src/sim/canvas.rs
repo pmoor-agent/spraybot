@@ -6,11 +6,11 @@ use bevy::mesh::Indices;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
+use crate::core::types::NozzleCap;
 use crate::sim::state::{AppConfig, SimClock, SimStepSet, SprayJobRes};
 
 /// Spray cone half-angle (12 degrees).
 pub const CONE_HALF_ANGLE_RAD: f32 = 12.0_f32 * PI / 180.0;
-const TAN_CONE_HALF_ANGLE: f32 = 0.212_556_56; // tan(12 deg)
 
 /// Warm unprimed gesso off-white (#F4F1EA).
 pub const GESSO_SRGB: [u8; 3] = [244, 241, 234];
@@ -29,7 +29,7 @@ const THICKNESS_ACCUM_SCALE: f32 = 0.38;
 const ADAPTIVE_COARSE_DT: f64 = 0.003;
 
 /// Maximum sub-steps per coarse interval to bound work on extreme edge cases.
-const MAX_SUBSTEPS_PER_COARSE: usize = 64;
+const MAX_SUBSTEPS_PER_COARSE: usize = 160;
 
 /// Registers the dynamic PBR wall canvas and ray-plane spray deposition systems.
 pub fn plugin(app: &mut App) {
@@ -130,7 +130,8 @@ impl CanvasPaintBuffer {
         roughness_from_thickness(self.thickness[idx])
     }
 
-    /// Deposits one sub-step of aerosol spray from `(nozzle_pos, nozzle_dir)` onto the canvas plane.
+    /// Deposits one sub-step of aerosol spray from `(nozzle_pos, nozzle_dir)` onto the canvas plane
+    /// using the default `Fat` nozzle cap.
     ///
     /// Returns the inclusive dirty pixel bounding box `(min_x, min_y, max_x, max_y)` if any texel changed.
     pub fn splat_cone(
@@ -140,6 +141,29 @@ impl CanvasPaintBuffer {
         paint_linear: [f32; 3],
         flow_scale: f32,
         dt_sub: f32,
+    ) -> Option<(u32, u32, u32, u32)> {
+        self.splat_cone_with_cap(
+            nozzle_pos,
+            nozzle_dir,
+            paint_linear,
+            flow_scale,
+            dt_sub,
+            NozzleCap::Fat,
+        )
+    }
+
+    /// Deposits one sub-step of aerosol spray from `(nozzle_pos, nozzle_dir)` onto the canvas plane
+    /// using the specified [`NozzleCap`] cone half-angle and orifice flow factor.
+    ///
+    /// Returns the inclusive dirty pixel bounding box `(min_x, min_y, max_x, max_y)` if any texel changed.
+    pub fn splat_cone_with_cap(
+        &mut self,
+        nozzle_pos: Vec3,
+        nozzle_dir: Vec3,
+        paint_linear: [f32; 3],
+        flow_scale: f32,
+        dt_sub: f32,
+        cap: NozzleCap,
     ) -> Option<(u32, u32, u32, u32)> {
         if flow_scale <= 0.0 || dt_sub <= 0.0 {
             return None;
@@ -156,7 +180,8 @@ impl CanvasPaintBuffer {
         }
 
         let hit = nozzle_pos + dir * t_hit;
-        let spot_radius = (t_hit * TAN_CONE_HALF_ANGLE).max(1e-4);
+        let tan_half = cap.cone_half_angle_rad().tan();
+        let spot_radius = (t_hit * tan_half).max(1e-4);
         let cos_phi = (-dir.z).clamp(0.25, 1.0);
         let max_extent = 1.45 * spot_radius / cos_phi;
 
@@ -195,7 +220,8 @@ impl CanvasPaintBuffer {
 
         // Scale area by 1 / cos(phi) to conserve paint mass across oblique incidence ellipses.
         let plume_area = (PI * spot_radius * spot_radius / cos_phi).max(1e-6);
-        let dose_coeff = SPRAY_FLOW_RATE * flow_scale * dt_sub / plume_area;
+        let dose_coeff =
+            SPRAY_FLOW_RATE * cap.orifice_flow_factor() * flow_scale * dt_sub / plume_area;
 
         let mut dirty_x0 = u32::MAX;
         let mut dirty_y0 = u32::MAX;
@@ -219,7 +245,7 @@ impl CanvasPaintBuffer {
                 }
 
                 let perp_sq = (rel - dir * axial).length_squared();
-                let r_local = axial * TAN_CONE_HALF_ANGLE;
+                let r_local = axial * tan_half;
                 let u_cone_sq = perp_sq / (r_local * r_local).max(1e-8);
                 if u_cone_sq > 1.35 * 1.35 {
                     continue;
@@ -491,8 +517,8 @@ fn update_canvas_deposition(
         }
 
         let active_ref = if s0.spray_active { &s0 } else { &s1 };
-        let standoff = (active_ref.nozzle_world_pos.z - z_plane).abs().max(0.04);
-        let spot_radius = standoff * TAN_CONE_HALF_ANGLE;
+        let standoff = (active_ref.nozzle_world_pos.z - z_plane).abs().max(0.025);
+        let spot_radius = standoff * active_ref.active_cap.cone_half_angle_rad().tan();
         let max_disp = (0.25 * spot_radius).max(1e-4);
 
         let nozzle_disp = (s1.nozzle_world_pos - s0.nozzle_world_pos).length();
@@ -515,12 +541,13 @@ fn update_canvas_deposition(
             };
             let paint_linear = srgb_u8_to_linear_rgb(can.color_srgb);
 
-            if let Some(rect) = canvas_res.buffer.splat_cone(
+            if let Some(rect) = canvas_res.buffer.splat_cone_with_cap(
                 frame.nozzle_world_pos,
                 frame.nozzle_world_dir,
                 paint_linear,
                 frame.flow_scale,
                 dt_sub as f32,
+                frame.active_cap,
             ) {
                 dirty = Some(match dirty {
                     Some((x0, y0, x1, y1)) => {
@@ -863,5 +890,69 @@ mod tests {
         // Reset restores clean gesso and 0.88 matte roughness
         buf.reset();
         assert!((buf.roughness_at(center_px.0, center_px.1) - 0.88).abs() < 1e-6);
+    }
+
+    #[test]
+    fn skinny_cap_paints_crisp_thin_line_with_high_centerline_opacity() {
+        let studio = StudioConfig::default();
+        let w = 1024_u32;
+        let h = 614_u32;
+        let mut fat_buf = CanvasPaintBuffer::new(
+            w,
+            h,
+            studio.canvas_center,
+            studio.canvas_width,
+            studio.canvas_height,
+            42,
+        );
+        let mut skinny_buf = fat_buf.clone();
+
+        let center_px = skinny_buf.world_to_pixel(Vec2::new(0.0, 1.55)).unwrap();
+        let sweep_y = skinny_buf.pixel_to_world(center_px.0, center_px.1).y;
+        let paint_black = [0.0_f32, 0.0, 0.0];
+        let speed = 0.14_f32;
+        let dt_sub = 0.002_f32;
+        let standoff = 0.08_f32;
+        let mut x = -0.15_f32;
+        while x <= 0.15 {
+            let pos = Vec3::new(x, sweep_y, standoff);
+            fat_buf.splat_cone_with_cap(pos, Vec3::NEG_Z, paint_black, 1.0, dt_sub, NozzleCap::Fat);
+            skinny_buf.splat_cone_with_cap(
+                pos,
+                Vec3::NEG_Z,
+                paint_black,
+                1.0,
+                dt_sub,
+                NozzleCap::Skinny,
+            );
+            x += speed * dt_sub;
+        }
+
+        let mut fat_width = 0_u32;
+        let mut skinny_width = 0_u32;
+        for py in 0..h {
+            let idx = (py as usize) * (w as usize) + (center_px.0 as usize);
+            if fat_buf.thickness[idx] > 0.02 {
+                fat_width += 1;
+            }
+            if skinny_buf.thickness[idx] > 0.02 {
+                skinny_width += 1;
+            }
+        }
+
+        assert!(skinny_width > 0, "Skinny cap should paint a visible stroke");
+        assert!(
+            (skinny_width as f32) < 0.35 * (fat_width as f32),
+            "Skinny width ({skinny_width}px) must be < 35% of Fat width ({fat_width}px)"
+        );
+
+        let center_idx = (center_px.1 as usize) * (w as usize) + (center_px.0 as usize);
+        let gesso_luma = skinny_buf.gesso_linear[0];
+        let center_luma = skinny_buf.linear_rgb[center_idx][0];
+        let coverage = 1.0 - (center_luma / gesso_luma);
+        assert!(
+            coverage > 0.90,
+            "Skinny centerline opacity/coverage should be high (> 0.90), got {coverage:.3}"
+        );
     }
 }

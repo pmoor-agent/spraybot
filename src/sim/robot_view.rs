@@ -18,13 +18,13 @@ pub struct RobotLink {
     pub index: usize,
 }
 
-/// Identifies a parallel gripper jaw child of Link 6 (`side`: `-1.0` left, `+1.0` right).
+/// Identifies a parallel gripper jaw child of Link 8 (`flange_roll`; `side`: `-1.0` left, `+1.0` right).
 #[derive(Component, Debug, Clone, Copy)]
 pub struct GripperJaw {
     pub side: f32,
 }
 
-/// Identifies the servo trigger finger child of Link 6 that depresses the aerosol nozzle cap.
+/// Identifies the servo trigger finger child of Link 8 (`flange_roll`) that depresses the aerosol nozzle cap.
 #[derive(Component, Debug, Clone, Copy)]
 pub struct TriggerFinger;
 
@@ -248,8 +248,8 @@ fn spawn_robot_and_cans(
         ],
     ));
 
-    // Link 2: shoulder_pitch upper arm (extends +Y by L2 = 0.68m to elbow_pitch)
-    let l2 = studio.upper_arm_l2;
+    // Link 2: shoulder_pitch lower half of upper arm (extends +Y by L2 * 0.5 = 0.34m to upper_arm_roll)
+    let half_l2 = studio.upper_arm_l2 * 0.5;
     commands.spawn((
         RobotLink { index: 2 },
         link_tf(2),
@@ -266,41 +266,95 @@ fn spawn_robot_and_cans(
                 MeshMaterial3d(graphite_mat.clone()),
                 Transform::from_rotation(Quat::from_rotation_z(FRAC_PI_2)),
             ),
-            // Tapered safety-orange upper arm beam
+            // Tapered safety-orange lower upper-arm beam (y = 0 .. half_l2)
             (
                 Mesh3d(
                     meshes.add(
                         ConicalFrustum {
-                            radius_top: 0.056,
+                            radius_top: 0.062,
                             radius_bottom: 0.072,
-                            height: l2 - 0.06,
+                            height: (half_l2 - 0.04).max(0.05),
                         }
                         .mesh()
                         .resolution(32),
                     ),
                 ),
                 MeshMaterial3d(safety_orange_mat.clone()),
-                Transform::from_xyz(0.0, l2 * 0.5, 0.0),
+                Transform::from_xyz(0.0, half_l2 * 0.5, 0.0),
             ),
-            // Structural graphite spine rib & collar flanges
+            // Structural graphite spine rib
             (
-                Mesh3d(meshes.add(Cuboid::new(0.046, l2 - 0.10, 0.138))),
+                Mesh3d(meshes.add(Cuboid::new(0.046, (half_l2 - 0.08).max(0.05), 0.136))),
                 MeshMaterial3d(graphite_mat.clone()),
-                Transform::from_xyz(0.0, l2 * 0.5, 0.012),
+                Transform::from_xyz(0.0, half_l2 * 0.5, 0.012),
+            ),
+            // Machined dark-anodized & aluminum rotary swivel ring terminating at y = half_l2 (0.34m)
+            (
+                Mesh3d(meshes.add(Cylinder::new(0.066, 0.022))),
+                MeshMaterial3d(anodized_dark_mat.clone()),
+                Transform::from_xyz(0.0, half_l2 - 0.017, 0.0),
             ),
             (
-                Mesh3d(meshes.add(Cylinder::new(0.062, 0.045))),
-                MeshMaterial3d(anodized_dark_mat.clone()),
-                Transform::from_xyz(0.0, l2 - 0.045, 0.0),
+                Mesh3d(meshes.add(Cylinder::new(0.069, 0.006))),
+                MeshMaterial3d(aluminum_mat.clone()),
+                Transform::from_xyz(0.0, half_l2 - 0.003, 0.0),
             ),
         ],
     ));
 
-    // Link 3: elbow_pitch forearm (extends -Z by L3 = 0.60m to wrist_1)
-    let l3 = studio.forearm_l3;
+    // Link 3: upper_arm_roll rotary swivel joint at mid-upper-arm (+Y axis, extends +Y by L2 * 0.5 = 0.34m to elbow_pitch)
     commands.spawn((
         RobotLink { index: 3 },
         link_tf(3),
+        Visibility::default(),
+        children![
+            // Sleek rotary bearing collar at y = 0
+            (
+                Mesh3d(meshes.add(Cylinder::new(0.068, 0.008))),
+                MeshMaterial3d(aluminum_mat.clone()),
+                Transform::from_xyz(0.0, 0.004, 0.0),
+            ),
+            (
+                Mesh3d(meshes.add(Cylinder::new(0.066, 0.020))),
+                MeshMaterial3d(anodized_dark_mat.clone()),
+                Transform::from_xyz(0.0, 0.018, 0.0),
+            ),
+            // Tapered safety-orange upper segment (y = 0 .. half_l2)
+            (
+                Mesh3d(
+                    meshes.add(
+                        ConicalFrustum {
+                            radius_top: 0.054,
+                            radius_bottom: 0.062,
+                            height: (half_l2 - 0.045).max(0.05),
+                        }
+                        .mesh()
+                        .resolution(32),
+                    ),
+                ),
+                MeshMaterial3d(safety_orange_mat.clone()),
+                Transform::from_xyz(0.0, half_l2 * 0.5 + 0.005, 0.0),
+            ),
+            // Structural graphite rib up to elbow drum
+            (
+                Mesh3d(meshes.add(Cuboid::new(0.044, (half_l2 - 0.09).max(0.05), 0.122))),
+                MeshMaterial3d(graphite_mat.clone()),
+                Transform::from_xyz(0.0, half_l2 * 0.5 + 0.005, 0.012),
+            ),
+            // Elbow-end anodized collar
+            (
+                Mesh3d(meshes.add(Cylinder::new(0.060, 0.036))),
+                MeshMaterial3d(anodized_dark_mat.clone()),
+                Transform::from_xyz(0.0, half_l2 - 0.036, 0.0),
+            ),
+        ],
+    ));
+
+    // Link 4: elbow_pitch forearm (extends -Z by L3 = 0.60m to wrist_1)
+    let l3 = studio.forearm_l3;
+    commands.spawn((
+        RobotLink { index: 4 },
+        link_tf(4),
         Visibility::default(),
         children![
             // Elbow joint drum & anodized caps
@@ -312,7 +366,7 @@ fn spawn_robot_and_cans(
             // Rear servo housing counterweight
             (
                 Mesh3d(meshes.add(Cuboid::new(0.108, 0.118, 0.145))),
-                MeshMaterial3d(cast_iron_mat),
+                MeshMaterial3d(cast_iron_mat.clone()),
                 Transform::from_xyz(0.0, 0.012, 0.078),
             ),
             // Safety-orange tapered forearm tube (-Z direction: top points along -Z via -FRAC_PI_2 around X)
@@ -328,7 +382,7 @@ fn spawn_robot_and_cans(
                         .resolution(32),
                     ),
                 ),
-                MeshMaterial3d(safety_orange_mat),
+                MeshMaterial3d(safety_orange_mat.clone()),
                 Transform::from_xyz(0.0, 0.0, -l3 * 0.5)
                     .with_rotation(Quat::from_rotation_x(-FRAC_PI_2)),
             ),
@@ -348,35 +402,35 @@ fn spawn_robot_and_cans(
         ],
     ));
 
-    // Link 4: wrist_1 machined aluminum roll housing (extends -Z by 0.09m to wrist_2)
+    // Link 5: wrist_1 machined aluminum roll housing (extends -Z by 0.065m to wrist_2)
     commands.spawn((
-        RobotLink { index: 4 },
-        link_tf(4),
+        RobotLink { index: 5 },
+        link_tf(5),
         Visibility::default(),
         children![
             (
-                Mesh3d(meshes.add(Cylinder::new(0.042, 0.062))),
+                Mesh3d(meshes.add(Cylinder::new(0.042, 0.046))),
                 MeshMaterial3d(aluminum_mat.clone()),
-                Transform::from_xyz(0.0, 0.0, -0.031)
+                Transform::from_xyz(0.0, 0.0, -0.023)
                     .with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
             ),
             (
-                Mesh3d(meshes.add(Cuboid::new(0.016, 0.062, 0.056))),
+                Mesh3d(meshes.add(Cuboid::new(0.016, 0.058, 0.044))),
                 MeshMaterial3d(aluminum_mat.clone()),
-                Transform::from_xyz(-0.040, 0.0, -0.072),
+                Transform::from_xyz(-0.040, 0.0, -0.054),
             ),
             (
-                Mesh3d(meshes.add(Cuboid::new(0.016, 0.062, 0.056))),
+                Mesh3d(meshes.add(Cuboid::new(0.016, 0.058, 0.044))),
                 MeshMaterial3d(aluminum_mat.clone()),
-                Transform::from_xyz(0.040, 0.0, -0.072),
+                Transform::from_xyz(0.040, 0.0, -0.054),
             ),
         ],
     ));
 
-    // Link 5: wrist_2 pitch clevis (extends -Z by 0.025m to flange_roll)
+    // Link 6: wrist_2 pitch clevis (extends -Z by 0.030m to wrist_yaw)
     commands.spawn((
-        RobotLink { index: 5 },
-        link_tf(5),
+        RobotLink { index: 6 },
+        link_tf(6),
         Visibility::default(),
         children![
             (
@@ -385,28 +439,67 @@ fn spawn_robot_and_cans(
                 Transform::from_rotation(Quat::from_rotation_z(FRAC_PI_2)),
             ),
             (
-                Mesh3d(meshes.add(Cuboid::new(0.056, 0.056, 0.030))),
+                Mesh3d(meshes.add(Cuboid::new(0.048, 0.046, 0.024))),
                 MeshMaterial3d(aluminum_mat.clone()),
-                Transform::from_xyz(0.0, 0.0, -0.013),
+                Transform::from_xyz(0.0, 0.0, -0.012),
+            ),
+            (
+                Mesh3d(meshes.add(Cylinder::new(0.023, 0.008))),
+                MeshMaterial3d(aluminum_mat.clone()),
+                Transform::from_xyz(0.0, 0.0, -0.026)
+                    .with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
             ),
         ],
     ));
 
-    // Link 6: flange_roll tool flange + parallel pneumatic gripper + servo trigger finger
+    // Link 7: wrist_yaw vertical rotary drum + machined aluminum U-yoke cheeks (+Y axis, extends -Z by 0.020m to flange_roll)
+    commands.spawn((
+        RobotLink { index: 7 },
+        link_tf(7),
+        Visibility::default(),
+        children![
+            // Vertical dark-anodized rotary drum (+Y axis)
+            (
+                Mesh3d(meshes.add(Cylinder::new(0.024, 0.064))),
+                MeshMaterial3d(anodized_dark_mat.clone()),
+                Transform::IDENTITY,
+            ),
+            // Machined aluminum U-yoke cheeks aligned along +Y / -Z
+            (
+                Mesh3d(meshes.add(Cuboid::new(0.009, 0.056, 0.024))),
+                MeshMaterial3d(aluminum_mat.clone()),
+                Transform::from_xyz(-0.026, 0.0, -0.008),
+            ),
+            (
+                Mesh3d(meshes.add(Cuboid::new(0.009, 0.056, 0.024))),
+                MeshMaterial3d(aluminum_mat.clone()),
+                Transform::from_xyz(0.026, 0.0, -0.008),
+            ),
+            // Flange-mount boss bridging yoke cheeks to flange_roll at z = -0.020
+            (
+                Mesh3d(meshes.add(Cylinder::new(0.028, 0.012))),
+                MeshMaterial3d(aluminum_mat.clone()),
+                Transform::from_xyz(0.0, 0.0, -0.014)
+                    .with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
+            ),
+        ],
+    ));
+
+    // Link 8: flange_roll tool flange + parallel pneumatic gripper + servo trigger finger
     // Grasp center (tcp_offset) is at local (0, 0, -0.025).
     let jaw_mesh = meshes.add(Cuboid::new(0.012, 0.044, 0.040));
     let jaw_pad_mesh = meshes.add(Cuboid::new(0.004, 0.038, 0.034));
 
     commands.spawn((
-        RobotLink { index: 6 },
-        link_tf(6),
+        RobotLink { index: 8 },
+        link_tf(8),
         Visibility::default(),
         children![
             // Tool flange disc
             (
                 Mesh3d(meshes.add(Cylinder::new(0.039, 0.012))),
                 MeshMaterial3d(aluminum_mat.clone()),
-                Transform::from_xyz(0.0, 0.0, -0.004)
+                Transform::from_xyz(0.0, 0.0, -0.006)
                     .with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
             ),
             // Pneumatic parallel gripper body & linear rail
@@ -691,6 +784,65 @@ mod tests {
         let y_rel = (released * tip_local).y;
         let y_dep = (pressed * tip_local).y;
         assert!(y_dep < y_rel - 0.004);
+    }
+
+    #[test]
+    fn spawns_all_nine_robot_links_matching_fk_and_end_effector_on_link_8() {
+        use clap::Parser;
+
+        use crate::cli::CliArgs;
+        use crate::core::types::StudioConfig;
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.insert_resource(Assets::<Mesh>::default());
+        app.insert_resource(Assets::<StandardMaterial>::default());
+        app.insert_resource(AppConfig::new(CliArgs::parse_from(["spraybot"])));
+        let studio = StudioConfig::default();
+        let job_res = SprayJobRes::empty(&studio);
+        let expected_links = job_res.chain.fk_links(&job_res.current_frame.joints);
+        app.insert_resource(job_res);
+        app.add_plugins(plugin);
+        app.update();
+
+        let world = app.world_mut();
+        let mut link_q = world.query::<(Entity, &RobotLink, &Transform)>();
+        let mut seen = vec![false; 9];
+        let mut link8_entity = None;
+        for (entity, link, tf) in link_q.iter(world) {
+            assert!(link.index < 9, "unexpected RobotLink index {}", link.index);
+            assert!(!seen[link.index], "duplicate RobotLink index {}", link.index);
+            seen[link.index] = true;
+            let expected = expected_links[link.index];
+            assert!(
+                (tf.translation - expected.pos).length() < 1e-5,
+                "link {} pos mismatch: {:?} vs {:?}",
+                link.index,
+                tf.translation,
+                expected.pos
+            );
+            assert!(
+                tf.rotation.dot(expected.rot).abs() > 1.0 - 1e-5,
+                "link {} rot mismatch: {:?} vs {:?} (angle_between={:?})",
+                link.index,
+                tf.rotation,
+                expected.rot,
+                tf.rotation.angle_between(expected.rot)
+            );
+            if link.index == 8 {
+                link8_entity = Some(entity);
+            }
+        }
+        assert!(seen.iter().all(|&v| v), "missing RobotLink in 0..9: {seen:?}");
+
+        let link8 = link8_entity.expect("link 8 must exist");
+        let mut jaw_q = world.query::<(&GripperJaw, &ChildOf)>();
+        let jaw_parents: Vec<Entity> = jaw_q.iter(world).map(|(_, p)| p.parent()).collect();
+        assert_eq!(jaw_parents, vec![link8, link8]);
+
+        let mut trigger_q = world.query_filtered::<&ChildOf, With<TriggerFinger>>();
+        let trigger_parents: Vec<Entity> = trigger_q.iter(world).map(|p| p.parent()).collect();
+        assert_eq!(trigger_parents, vec![link8]);
     }
 }
 

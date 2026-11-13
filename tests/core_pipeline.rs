@@ -96,6 +96,8 @@ fn verify_svg_end_to_end(rel_path: &str, max_cans: usize) -> PipelineVerifyResul
     let mut max_fat_tilt_xy = 0.0_f32;
     let mut max_skinny_tilt_xy = 0.0_f32;
     let mut max_abs_wrist_yaw = 0.0_f64;
+    let mut rail_x_travel_total = 0.0_f64;
+    let mut rail_x_travel_spray = 0.0_f64;
 
     for i in 0..=step_count {
         let t = (i as f64 / sample_rate_hz).min(duration);
@@ -131,6 +133,11 @@ fn verify_svg_end_to_end(rel_path: &str, max_cans: usize) -> PipelineVerifyResul
         }
 
         if let Some(s0) = prev_frame {
+            let dq0 = (frame.joints[0] - s0.joints[0]).abs();
+            rail_x_travel_total += dq0;
+            if s0.spray_active || frame.spray_active {
+                rail_x_travel_spray += dq0;
+            }
             if s0.spray_active && frame.spray_active {
                 let max_dof = (0..9)
                     .map(|dof| (frame.joints[dof] - s0.joints[dof]).abs())
@@ -212,7 +219,7 @@ fn verify_svg_end_to_end(rel_path: &str, max_cans: usize) -> PipelineVerifyResul
         "{rel_path}: expected substantial active spray samples, got {spray_count}"
     );
     println!(
-        "{rel_path}: timeline.duration() = {duration:.2}s ({} ops, {} samples @ 60 Hz, {spray_count} active spray samples, max_fat_tilt_xy={max_fat_tilt_xy:.4}, max_skinny_tilt_xy={max_skinny_tilt_xy:.4}, max_abs_wrist_yaw={max_abs_wrist_yaw:.4})",
+        "{rel_path}: timeline.duration() = {duration:.2}s ({} ops, {} samples @ 60 Hz, {spray_count} active spray samples, rail_x_total={rail_x_travel_total:.3}m, rail_x_spray={rail_x_travel_spray:.3}m, max_fat_tilt_xy={max_fat_tilt_xy:.4}, max_skinny_tilt_xy={max_skinny_tilt_xy:.4}, max_abs_wrist_yaw={max_abs_wrist_yaw:.4})",
         job.ops.len(),
         step_count + 1
     );

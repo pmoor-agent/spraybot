@@ -72,7 +72,7 @@ impl KinematicChain {
                     max: studio.rail_q0_max as f64,
                     max_vel: 1.2,
                     max_accel: 2.5,
-                    ik_weight: 2.5,
+                    ik_weight: 30.0,
                 },
                 JointSpec {
                     name: "base_yaw".to_string(),
@@ -83,7 +83,7 @@ impl KinematicChain {
                     max: PI,
                     max_vel: 2.4,
                     max_accel: 6.0,
-                    ik_weight: 1.5,
+                    ik_weight: 1.0,
                 },
                 JointSpec {
                     name: "shoulder_pitch".to_string(),
@@ -105,7 +105,7 @@ impl KinematicChain {
                     max: PI,
                     max_vel: 2.8,
                     max_accel: 8.0,
-                    ik_weight: 1.1,
+                    ik_weight: 1.4,
                 },
                 JointSpec {
                     name: "elbow_pitch".to_string(),
@@ -302,6 +302,17 @@ impl KinematicChain {
 
     /// Computes an analytical elbow-up seed for reaching a desired grasp frame `(grasp_pos, grasp_dir)`.
     pub fn smart_seed_for_grasp(&self, grasp_pos: Vec3, grasp_dir: Vec3) -> [f64; 9] {
+        self.smart_seed_for_grasp_with_q0_deadband(grasp_pos, grasp_dir, None)
+    }
+
+    /// Analytical elbow-up seed for `grasp_pos`, optionally biasing `q0` near `q0_seed` within
+    /// `[p_w.x - dx_deadband, p_w.x + dx_deadband]` instead of snapping straight to `p_w.x`.
+    fn smart_seed_for_grasp_with_q0_deadband(
+        &self,
+        grasp_pos: Vec3,
+        grasp_dir: Vec3,
+        seed_q0_deadband: Option<(f64, f64)>,
+    ) -> [f64; 9] {
         let l2 = (self.joints[3].offset.y + self.joints[4].offset.y) as f64;
         let l3 = -self.joints[5].offset.z as f64;
         let d_wrist_j6 = -self.joints[6].offset.z as f64;
@@ -314,7 +325,12 @@ impl KinematicChain {
         // Estimate wrist_2 (J6) center back along -grasp_dir from grasp center
         let p_w = g_pos - g_dir * d_j6_grasp;
 
-        let q0 = p_w.x.clamp(self.joints[0].min, self.joints[0].max);
+        let q0 = match seed_q0_deadband {
+            Some((q0_seed, dx_deadband)) => q0_seed
+                .clamp(p_w.x - dx_deadband, p_w.x + dx_deadband)
+                .clamp(self.joints[0].min, self.joints[0].max),
+            None => p_w.x.clamp(self.joints[0].min, self.joints[0].max),
+        };
         let shoulder = DVec3::new(
             q0,
             (self.base_origin.y + self.joints[1].offset.y + self.joints[2].offset.y) as f64,
@@ -374,6 +390,48 @@ impl KinematicChain {
         self.smart_seed_for_grasp(grasp_pos.as_vec3(), target_dir)
     }
 
+    /// Computes an analytical elbow-up nozzle seed while keeping `q0` near `q_seed[0]` inside
+    /// the comfortable lateral deadband around the wrist target.
+    fn smart_seed_for_nozzle_from_seed(
+        &self,
+        q_seed: &[f64; 9],
+        target_pos: Vec3,
+        target_dir: Vec3,
+    ) -> [f64; 9] {
+        let dir = target_dir.as_dvec3().normalize();
+        let rot = upright_rot_from_neg_z(dir, DVec3::Y);
+        let grasp_pos = target_pos.as_dvec3() - rot * self.nozzle_local_pos.as_dvec3();
+        let dx_seed_deadband = self.comfort_dx_nozzle(target_pos.as_dvec3()) * 0.70;
+        self.smart_seed_for_grasp_with_q0_deadband(
+            grasp_pos.as_vec3(),
+            target_dir,
+            Some((q_seed[0], dx_seed_deadband)),
+        )
+    }
+
+    /// Comfortable lateral reach `dx_comfort` (meters) from the shoulder to a nozzle target
+    /// at `(target_pos.y, target_pos.z)`, wide at mid-canvas and tapering near high corners.
+    fn comfort_dx_nozzle(&self, target_pos: DVec3) -> f64 {
+        let l2 = (self.joints[3].offset.y + self.joints[4].offset.y) as f64;
+        let l3 = -self.joints[5].offset.z as f64;
+        let d_wrist_j6 = -self.joints[6].offset.z as f64;
+        let d_j6_grasp =
+            -(self.joints[7].offset.z + self.joints[8].offset.z + self.tcp_offset.z) as f64;
+        let l3_eff = l3 + d_wrist_j6;
+        let shoulder_y =
+            (self.base_origin.y + self.joints[1].offset.y + self.joints[2].offset.y) as f64;
+        let shoulder_z = self.base_origin.z as f64;
+
+        let y_w = target_pos.y - self.nozzle_local_pos.y as f64;
+        let z_w = target_pos.z - self.nozzle_local_pos.z as f64 + d_j6_grasp;
+        let dy = y_w - shoulder_y;
+        let dz = z_w - shoulder_z;
+
+        let r_comfort = 0.90 * (l2 + l3_eff);
+        let rad_sq = (r_comfort * r_comfort - (dy * dy + dz * dz)).max(0.0);
+        rad_sq.sqrt().clamp(0.06, 0.44)
+    }
+
     /// Core Weighted Damped Least-Squares iteration loop for nozzle or grasp targets.
     fn solve_dls_internal(
         &self,
@@ -392,7 +450,13 @@ impl KinematicChain {
         // Diagonal joint weights W and inverse W^{-1}
         let mut w_inv = SMatrix::<f64, 9, 9>::zeros();
         for i in 0..9 {
-            let w = self.joints[i].ik_weight.max(1e-6);
+            let w = if i == 0 && !use_nozzle_tcp {
+                // Keep rail agile during 6-DOF rack/cap-station grasps
+                2.5
+            } else {
+                self.joints[i].ik_weight
+            }
+            .max(1e-6);
             w_inv[(i, i)] = 1.0 / w;
         }
 
@@ -515,17 +579,28 @@ impl KinematicChain {
             let dq_task = if let Some(chol) = a_mat.cholesky() {
                 let y = chol.solve(&e_vec);
                 let dq_t = w_inv_jt * y;
-                // Null-space projector (I - J#_W * J_s)
-                let x_mat = chol.solve(&j_s);
-                let j_pinv_j = w_inv_jt * x_mat;
-                let null_proj = SMatrix::<f64, 9, 9>::identity() - j_pinv_j;
 
                 let mut v_null = SVector::<f64, 9>::zeros();
                 for i in 0..9 {
                     let j_spec = &self.joints[i];
                     let comfort_pull = if i == 0 {
-                        let target_x = target_pos.x.clamp(j_spec.min, j_spec.max);
-                        0.28 * (target_x - q[0])
+                        if use_nozzle_tcp {
+                            let dx_comfort = self.comfort_dx_nozzle(target_pos);
+                            let low = (target_pos.x - dx_comfort).clamp(j_spec.min, j_spec.max);
+                            let high = (target_pos.x + dx_comfort).clamp(j_spec.min, j_spec.max);
+                            if q[0] < low {
+                                let err = low - q[0];
+                                0.55 * err * (err / 0.04).min(1.0)
+                            } else if q[0] > high {
+                                let err = q[0] - high;
+                                -0.55 * err * (err / 0.04).min(1.0)
+                            } else {
+                                0.0
+                            }
+                        } else {
+                            let target_x = target_pos.x.clamp(j_spec.min, j_spec.max);
+                            0.28 * (target_x - q[0])
+                        }
                     } else {
                         alpha_null * (self.comfort_pose[i] - q[i])
                     };
@@ -547,7 +622,32 @@ impl KinematicChain {
                     }
                     v_null[i] = comfort_pull + repulse;
                 }
-                let mut dq_null = null_proj * v_null;
+                let mut dq_null = if use_nozzle_tcp {
+                    // Project arm comfort pulls into the 8-DOF arm-only null space so they never
+                    // drag rail_x inside the deadband, and engage rail_x smoothly outside it.
+                    let mut v_arm = v_null;
+                    v_arm[0] = 0.0;
+                    let mut w_inv_arm = w_inv;
+                    w_inv_arm[(0, 0)] = 0.0;
+                    let w_inv_arm_jt = w_inv_arm * j_s.transpose();
+                    let mut a_arm = j_s * w_inv_arm_jt;
+                    for k in 0..6 {
+                        a_arm[(k, k)] += lambda * lambda;
+                    }
+                    let mut dq_arm = if let Some(chol_arm) = a_arm.cholesky() {
+                        v_arm - w_inv_arm_jt * chol_arm.solve(&(j_s * v_arm))
+                    } else {
+                        SVector::<f64, 9>::zeros()
+                    };
+                    if v_null[0].abs() > 1e-12 {
+                        let mut v_rail = SVector::<f64, 9>::zeros();
+                        v_rail[0] = v_null[0];
+                        dq_arm += v_rail - w_inv_jt * chol.solve(&(j_s * v_rail));
+                    }
+                    dq_arm
+                } else {
+                    v_null - w_inv_jt * chol.solve(&(j_s * v_null))
+                };
                 let max_null = dq_null.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
                 if max_null > 0.04 {
                     dq_null *= 0.04 / max_null;
@@ -626,14 +726,20 @@ impl KinematicChain {
         let seed_noz_dist = (self.fk_nozzle(q_seed).0 - target_pos).length();
         let (q1, pos_err1, rot_err1) =
             self.solve_dls_internal(q_seed, p_t, d_t, u_t, None, true, mode, 16);
+        let dx_reach = self.comfort_dx_nozzle(p_t) + 0.03;
         let q1_clean = seed_noz_dist < 0.30
-            || ((q1[0] - target_pos.x as f64).abs() <= 0.25 && q1[7].abs() <= 0.45);
+            || ((q1[0] - target_pos.x as f64).abs() <= dx_reach
+                && q1[1].abs() <= 1.35
+                && q1[3].abs() <= 1.40
+                && q1[4].abs() <= 1.65
+                && q1[7].abs() <= 1.35
+                && self.min_world_z(&q1, true) > 0.012);
         if q1_clean && pos_err1 <= 5e-4 && rot_err1 <= 0.2_f64.to_radians() {
             return Ok(q1);
         }
 
-        // Fallback from analytical elbow-up seed for large jumps / branch recovery
-        let smart = self.smart_seed_for_nozzle(target_pos, target_dir);
+        // Fallback from analytical elbow-up seed preserving carriage position inside deadband
+        let smart = self.smart_seed_for_nozzle_from_seed(q_seed, target_pos, target_dir);
         let (q2, pos_err2, rot_err2) =
             self.solve_dls_internal(&smart, p_t, d_t, u_t, None, true, mode, 24);
         if pos_err2 <= 5e-4 && rot_err2 <= 0.2_f64.to_radians() {
@@ -681,7 +787,7 @@ impl KinematicChain {
             return Ok((q1, false));
         }
 
-        let smart = self.smart_seed_for_nozzle(target_pos, target_dir);
+        let smart = self.smart_seed_for_nozzle_from_seed(q_seed, target_pos, target_dir);
         let (q2, pos_err2, rot_err2) =
             self.solve_dls_internal(&smart, p_t, d_t, u_t, None, true, mode, 32);
         if pos_err2 <= 1.0e-3 && rot_err2 <= 0.35_f64.to_radians() {
@@ -1112,6 +1218,143 @@ mod tests {
                 "Wrist delta too large on oblique scanline (yaw={yaw_deg}deg): max_wrist_dq={max_wrist_dq:.5}"
             );
         }
+    }
+
+    #[test]
+    fn local_36cm_square_and_circle_hatch_arm_first_keeps_rail_planted() {
+        let studio = StudioConfig::default();
+        let chain = KinematicChain::default_spraybot(&studio);
+
+        let center = Vec3::new(0.0, 1.55, 0.14);
+        let mode = IkMode::Spray { roll_weight: 0.15 };
+        let q_init = chain
+            .solve_ik(&chain.comfort_pose, center, Vec3::NEG_Z, mode)
+            .expect("Initial mid-canvas IK should succeed");
+
+        // Build a 36cm square contour + horizontal hatch lines + 36cm circle around (0.0, 1.55, 0.14)
+        let half = 0.18_f32;
+        let mut waypoints: Vec<Vec3> = Vec::new();
+        let corners = [
+            Vec3::new(-half, center.y - half, center.z),
+            Vec3::new(half, center.y - half, center.z),
+            Vec3::new(half, center.y + half, center.z),
+            Vec3::new(-half, center.y + half, center.z),
+            Vec3::new(-half, center.y - half, center.z),
+        ];
+        // Smooth 5mm lead-in from center to first corner
+        let lead_steps = (((corners[0] - center).length() / 0.005).ceil() as usize).max(1);
+        for k in 1..=lead_steps {
+            waypoints.push(center.lerp(corners[0], k as f32 / lead_steps as f32));
+        }
+        for w in corners.windows(2) {
+            let steps = (((w[1] - w[0]).length() / 0.005).ceil() as usize).max(1);
+            for k in 1..=steps {
+                waypoints.push(w[0].lerp(w[1], k as f32 / steps as f32));
+            }
+        }
+        // Horizontal boustrophedon hatch lines across the 36cm square
+        for row in 0..=6 {
+            let y = (center.y - half) + (2.0 * half) * (row as f32 / 6.0);
+            let (x0, x1) = if row % 2 == 0 {
+                (-half, half)
+            } else {
+                (half, -half)
+            };
+            let p0 = Vec3::new(x0, y, center.z);
+            let p1 = Vec3::new(x1, y, center.z);
+            let prev = *waypoints.last().unwrap();
+            let link_steps = (((p0 - prev).length() / 0.005).ceil() as usize).max(1);
+            for k in 1..=link_steps {
+                waypoints.push(prev.lerp(p0, k as f32 / link_steps as f32));
+            }
+            let h_steps = (((p1 - p0).length() / 0.005).ceil() as usize).max(1);
+            for k in 1..=h_steps {
+                waypoints.push(p0.lerp(p1, k as f32 / h_steps as f32));
+            }
+        }
+        // 36cm diameter circle
+        let circle_steps = 226usize;
+        let c_start = Vec3::new(center.x + half, center.y, center.z);
+        let prev = *waypoints.last().unwrap();
+        let link_steps = (((c_start - prev).length() / 0.005).ceil() as usize).max(1);
+        for k in 1..=link_steps {
+            waypoints.push(prev.lerp(c_start, k as f32 / link_steps as f32));
+        }
+        for k in 1..=circle_steps {
+            let theta = 2.0 * std::f32::consts::PI * (k as f32 / circle_steps as f32);
+            waypoints.push(Vec3::new(
+                center.x + half * theta.cos(),
+                center.y + half * theta.sin(),
+                center.z,
+            ));
+        }
+
+        let mut q_prev = q_init;
+        let mut min_q = [f64::INFINITY; 9];
+        let mut max_q = [f64::NEG_INFINITY; 9];
+        for i in 0..9 {
+            min_q[i] = min_q[i].min(q_prev[i]);
+            max_q[i] = max_q[i].max(q_prev[i]);
+        }
+
+        for (step, &target_pos) in waypoints.iter().enumerate() {
+            let (q_k, reconfigured) = chain
+                .solve_ik_continuous(&q_prev, target_pos, Vec3::NEG_Z, mode)
+                .unwrap_or_else(|e| panic!("Local 36cm step {step} failed: {e}"));
+            assert!(
+                !reconfigured,
+                "Unexpected reconfiguration on local 36cm shape at step {step}"
+            );
+            assert!(chain.within_limits(&q_k, 1e-6));
+
+            let (noz_fk, dir_fk, _) = chain.fk_nozzle(&q_k);
+            let pos_err = (noz_fk - target_pos).length();
+            let dir_err_deg = dir_fk
+                .normalize()
+                .dot(Vec3::NEG_Z)
+                .clamp(-1.0, 1.0)
+                .acos()
+                .to_degrees();
+            assert!(
+                pos_err < 0.0005,
+                "Local 36cm pos_err={pos_err:.6}m >= 0.5mm at step {step}"
+            );
+            assert!(
+                dir_err_deg < 0.35,
+                "Local 36cm dir_err={dir_err_deg:.4}deg >= 0.35deg at step {step}"
+            );
+            assert!(chain.min_world_z(&q_k, true) > 0.012);
+
+            for i in 0..9 {
+                min_q[i] = min_q[i].min(q_k[i]);
+                max_q[i] = max_q[i].max(q_k[i]);
+            }
+            q_prev = q_k;
+        }
+
+        let rail_excursion = max_q[0] - min_q[0];
+        let yaw_span = max_q[1] - min_q[1];
+        let pitch_span = (max_q[2] - min_q[2]).max(max_q[4] - min_q[4]);
+        let wrist_span = (5..9).map(|i| max_q[i] - min_q[i]).fold(0.0_f64, f64::max);
+        println!(
+            "local 36cm shape: rail_excursion={rail_excursion:.4}m, base_yaw_span={yaw_span:.3}rad, pitch_span={pitch_span:.3}rad, wrist_span={wrist_span:.3}rad"
+        );
+        assert!(
+            rail_excursion < 0.025,
+            "Expected rail_x excursion < 0.025m for local 36cm hatch/circle, got {rail_excursion:.4}m"
+        );
+        assert!(
+            yaw_span > 0.30,
+            "Expected base_yaw to lead horizontal motion (> 0.30 rad), got {yaw_span:.3} rad"
+        );
+        assert!(
+            pitch_span > 0.25,
+            "Expected shoulder/elbow pitch articulation (> 0.25 rad), got {pitch_span:.3} rad"
+        );
+        assert!(
+            wrist_span > 0.30,
+            "Expected wrist compensation (> 0.30 rad), got {wrist_span:.3} rad"
+        );
     }
 
     #[test]

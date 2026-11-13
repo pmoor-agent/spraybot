@@ -37,36 +37,51 @@ impl AppConfig {
 #[derive(Resource, Debug, Clone)]
 pub struct SimClock {
     pub t_sim: f64,
-    pub t_prev: f64,
+    pub prev_t_sim: f64,
+    pub total_duration: f64,
     pub speed: f32,
     pub paused: bool,
-    pub total_duration: f64,
-    /// When `Some(dt)`, each rendered frame advances by exact `dt * speed` (lockstep `--record`).
-    pub fixed_dt: Option<f64>,
-    pub end_hold_elapsed: f64,
+    pub show_gizmos: bool,
+    pub reset_epoch: u64,
+    pub hold_secs: f64,
+    pub hold_elapsed: f64,
     pub finished: bool,
+    pub warmup_frames_remaining: u32,
+}
+
+impl Default for SimClock {
+    fn default() -> Self {
+        Self {
+            t_sim: 0.0,
+            prev_t_sim: 0.0,
+            total_duration: 0.0,
+            speed: 1.0,
+            paused: false,
+            show_gizmos: false,
+            reset_epoch: 0,
+            hold_secs: 2.0,
+            hold_elapsed: 0.0,
+            finished: false,
+            warmup_frames_remaining: 3,
+        }
+    }
 }
 
 impl SimClock {
     pub fn from_cli(cli: &CliArgs, total_duration: f64) -> Self {
-        let fixed_dt = cli.record.as_ref().map(|_| 1.0 / (cli.fps.max(1) as f64));
         Self {
-            t_sim: 0.0,
-            t_prev: 0.0,
-            speed: cli.speed,
-            paused: false,
             total_duration,
-            fixed_dt,
-            end_hold_elapsed: 0.0,
-            finished: false,
+            speed: cli.speed,
+            ..Self::default()
         }
     }
 
     pub fn reset(&mut self) {
         self.t_sim = 0.0;
-        self.t_prev = 0.0;
-        self.end_hold_elapsed = 0.0;
+        self.prev_t_sim = 0.0;
+        self.hold_elapsed = 0.0;
         self.finished = false;
+        self.reset_epoch = self.reset_epoch.wrapping_add(1);
     }
 }
 

@@ -1,22 +1,27 @@
-use std::time::Duration;
-
 use bevy::{
-    app::ScheduleRunnerPlugin,
+    app::{RunMode, ScheduleRunnerPlugin},
     prelude::*,
-    window::ExitCondition,
+    render::{
+        RenderPlugin,
+        render_resource::{TextureFormat, TextureUsages},
+    },
+    window::{ExitCondition, WindowResolution},
     winit::WinitPlugin,
 };
 use clap::Parser;
 
-use spraybot::cli::CliArgs;
+use spraybot::cli::{CliArgs, DEFAULT_SVG_PATH};
 use spraybot::core::batching::{BatchConfig, batch_primitives};
 use spraybot::core::kinematics::KinematicChain;
 use spraybot::core::palette::quantize_palette;
 use spraybot::core::planner::{PlannerConfig, plan_job};
-use spraybot::core::svg_ingest::{IngestConfig, ingest_svg_file};
+use spraybot::core::svg_ingest::{IngestConfig, ingest_svg, ingest_svg_file};
 use spraybot::core::trajectory::CompiledTimeline;
 use spraybot::sim::SimPlugin;
 use spraybot::sim::state::{AppConfig, OffscreenRenderTarget, SimClock, SprayJobRes};
+
+/// Embedded fallback showcase SVG used when no path is given and `DEFAULT_SVG_PATH` is absent on disk.
+const DEFAULT_SVG_BYTES: &str = include_str!("../assets/examples/02_street_art_poster.svg");
 
 fn main() {
     let cli = CliArgs::parse();
@@ -26,18 +31,31 @@ fn main() {
     }
 
     let app_config = AppConfig::new(cli.clone());
-    let svg_path = cli.resolved_svg_path();
+    let ingest_cfg = IngestConfig::from_studio(&app_config.studio);
 
-    let primitives = if svg_path.exists() {
-        match ingest_svg_file(&svg_path, &IngestConfig::from_studio(&app_config.studio)) {
+    let primitives = match cli.svg_path.as_ref() {
+        Some(path) => match ingest_svg_file(path, &ingest_cfg) {
             Ok(prims) => prims,
             Err(err) => {
-                eprintln!("Failed to load SVG '{}': {err}", svg_path.display());
+                eprintln!("Failed to load SVG '{}': {err}", path.display());
                 std::process::exit(1);
             }
+        },
+        None => {
+            let default_path = std::path::Path::new(DEFAULT_SVG_PATH);
+            let result = if default_path.exists() {
+                ingest_svg_file(default_path, &ingest_cfg)
+            } else {
+                ingest_svg(DEFAULT_SVG_BYTES.as_bytes(), &ingest_cfg)
+            };
+            match result {
+                Ok(prims) => prims,
+                Err(err) => {
+                    eprintln!("Failed to load default showcase SVG: {err}");
+                    std::process::exit(1);
+                }
+            }
         }
-    } else {
-        Vec::new()
     };
 
     let palette = quantize_palette(&primitives, cli.max_cans, cli.seed);
@@ -50,6 +68,14 @@ fn main() {
     });
     let total_duration = timeline.duration();
     let current_frame = timeline.sample(0.0);
+
+    println!(
+        "SprayBot job compiled: {} primitives, {} cans, {} ops, {:.2}s duration",
+        primitives.len(),
+        palette.cans.len(),
+        job.ops.len(),
+        total_duration
+    );
 
     let sim_clock = SimClock::from_cli(&cli, total_duration);
     let spray_job = SprayJobRes {
@@ -65,11 +91,11 @@ fn main() {
     let mut app = App::new();
     app.insert_resource(app_config)
         .insert_resource(sim_clock)
-        .insert_resource(spray_job)
-        .insert_resource(OffscreenRenderTarget::default());
+        .insert_resource(spray_job);
+
+    let (width, height) = cli.resolution;
 
     if cli.headless {
-        let frame_interval = Duration::from_secs_f64(1.0 / cli.fps.max(1) as f64);
         app.add_plugins(
             DefaultPlugins
                 .set(WindowPlugin {
@@ -77,19 +103,42 @@ fn main() {
                     exit_condition: ExitCondition::DontExit,
                     ..default()
                 })
+                .set(RenderPlugin {
+                    synchronous_pipeline_compilation: true,
+                    ..default()
+                })
                 .disable::<WinitPlugin>(),
         )
-        .add_plugins(ScheduleRunnerPlugin::run_loop(frame_interval));
+        .add_plugins(ScheduleRunnerPlugin {
+            run_mode: RunMode::Loop { wait: None },
+        });
+
+        let mut target_image =
+            Image::new_target_texture(width, height, TextureFormat::Rgba8UnormSrgb, None);
+        target_image.texture_descriptor.usage |= TextureUsages::COPY_SRC;
+        let target_handle = app
+            .world_mut()
+            .resource_mut::<Assets<Image>>()
+            .add(target_image);
+        app.insert_resource(OffscreenRenderTarget {
+            image: Some(target_handle),
+        });
     } else {
-        let (width, height) = cli.resolution;
-        app.add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "SprayBot — 3D Mural Simulator".to_string(),
-                resolution: (width, height).into(),
+        let resolution = if cli.record.is_some() {
+            WindowResolution::new(width, height).with_scale_factor_override(1.0)
+        } else {
+            WindowResolution::new(width, height)
+        };
+        app.insert_resource(OffscreenRenderTarget::default())
+            .add_plugins(DefaultPlugins.set(WindowPlugin {
+                primary_window: Some(Window {
+                    title: "SprayBot".to_string(),
+                    resolution,
+                    resizable: cli.record.is_none(),
+                    ..default()
+                }),
                 ..default()
-            }),
-            ..default()
-        }));
+            }));
     }
 
     app.add_plugins(SimPlugin).run();

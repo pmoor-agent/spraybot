@@ -77,7 +77,9 @@ fn main() {
         total_duration
     );
 
-    let sim_clock = SimClock::from_cli(&cli, total_duration);
+    let mut sim_clock = SimClock::from_cli(&cli, total_duration);
+    // Allow sufficient initial frames for Bevy PMREM environment cubemap & shadow pipelines to warm up.
+    sim_clock.warmup_frames_remaining = 6;
     let spray_job = SprayJobRes {
         primitives,
         palette,
@@ -141,5 +143,8 @@ fn main() {
             }));
     }
 
-    app.add_plugins(SimPlugin).run();
+    let exit = app.add_plugins(SimPlugin).run();
+    if let bevy::app::AppExit::Error(code) = exit {
+        std::process::exit(code.get() as i32);
+    }
 }

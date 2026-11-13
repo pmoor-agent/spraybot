@@ -9,7 +9,7 @@ use i_overlay::core::fill_rule::FillRule as OverlayFillRule;
 use i_overlay::float::simplify::SimplifyShape;
 use kurbo::{Affine, BezPath, PathEl, Point as KurboPoint};
 
-use crate::core::types::{NormalizedPrimitive, PrimitiveGeom, StudioConfig};
+use crate::core::types::{GradientFillMeta, NormalizedPrimitive, PrimitiveGeom, StudioConfig};
 
 /// Minimum polygon area (m^2) below which degenerate slivers are discarded.
 const MIN_POLYGON_AREA_M2: f64 = 1e-6;
@@ -449,13 +449,23 @@ fn push_primitive(
     opacity: f32,
     geometry: PrimitiveGeom,
 ) {
+    push_primitive_with_meta(out, color_srgb, opacity, geometry, None);
+}
+
+fn push_primitive_with_meta(
+    out: &mut Vec<NormalizedPrimitive>,
+    color_srgb: [u8; 3],
+    opacity: f32,
+    geometry: PrimitiveGeom,
+    gradient_meta: Option<GradientFillMeta>,
+) {
     let id = out.len();
     out.push(NormalizedPrimitive {
         id,
         color_srgb,
         opacity,
         geometry,
-        gradient_meta: None,
+        gradient_meta,
     });
 }
 
@@ -654,6 +664,9 @@ fn emit_linear_gradient_bands(
 
     let dir = axis / axis_len;
     let perp = DVec2::new(-dir.y, dir.x);
+    let band_width = axis_len / bands as f64;
+    let back_overlap = 0.45 * band_width;
+    let front_pad = 0.20 * band_width;
 
     // Project polygon vertices onto (dir, perp) basis to bound band rectangles cleanly.
     let mut s_min = f64::INFINITY;
@@ -675,33 +688,49 @@ fn emit_linear_gradient_bands(
     let u1 = u_max + 0.5;
 
     for b in 0..bands {
-        let t0 = b as f64 / bands as f64;
-        let t1 = (b + 1) as f64 / bands as f64;
-        let t_mid = 0.5 * (t0 + t1);
-        let (color, stop_op) = sample_gradient_stops(lg.stops(), t_mid as f32, lg.spread_method());
+        let t_sample = b as f64 / (bands - 1) as f64;
+        let (color, stop_op) = sample_gradient_stops(lg.stops(), t_sample as f32, lg.spread_method());
         let band_opacity = (base_opacity * stop_op).clamp(0.0, 1.0);
         if band_opacity <= 0.0 {
             continue;
         }
 
+        let s_nom0 = b as f64 * band_width;
+        let s_nom1 = (b + 1) as f64 * band_width;
         let s0 = if b == 0 {
             s_min.min(0.0) - 0.5
         } else {
-            t0 * axis_len
+            s_nom0 - back_overlap
         };
         let s1 = if b + 1 == bands {
             s_max.max(axis_len) + 0.5
         } else {
-            t1 * axis_len
+            s_nom1 + front_pad
         };
         if s1 <= s0 + 1e-7 {
             continue;
         }
 
+        let fade_in_s = (b > 0).then_some((s_nom0 - 0.45 * band_width, s_nom0 + 0.18 * band_width));
+        let fade_out_s =
+            (b + 1 < bands).then_some((s_nom1 + 0.04 * band_width, s_nom1 + 0.20 * band_width));
+
         let slab = oriented_rect_polygon(p1, dir, perp, s0, s1, u0, u1);
         let clipped = filter_valid_polygons(mp.intersection_with_fill_rule(&slab, GeoFillRule::EvenOdd));
         if !clipped.0.is_empty() {
-            push_primitive(out, color, band_opacity, PrimitiveGeom::FilledPolygon(clipped));
+            push_primitive_with_meta(
+                out,
+                color,
+                band_opacity,
+                PrimitiveGeom::FilledPolygon(clipped),
+                Some(GradientFillMeta::Linear {
+                    origin: p1,
+                    dir,
+                    band_width,
+                    fade_in_s,
+                    fade_out_s,
+                }),
+            );
         }
     }
 }
@@ -732,19 +761,27 @@ fn emit_radial_gradient_bands(
 
     let cx = rg.cx() as f64;
     let cy = rg.cy() as f64;
+    let center = DVec2::new(center_world.x, center_world.y);
+    let band_width = world_radius / bands as f64;
+    let band_width_local = radius / bands as f64;
+    let back_overlap_local = 0.45 * band_width_local;
+    let front_pad_local = 0.20 * band_width_local;
 
     for b in 0..bands {
-        let t0 = b as f64 / bands as f64;
-        let t1 = (b + 1) as f64 / bands as f64;
-        let t_mid = 0.5 * (t0 + t1);
-        let (color, stop_op) = sample_gradient_stops(rg.stops(), t_mid as f32, rg.spread_method());
+        let t_sample = b as f64 / (bands - 1) as f64;
+        let (color, stop_op) = sample_gradient_stops(rg.stops(), t_sample as f32, rg.spread_method());
         let band_opacity = (base_opacity * stop_op).clamp(0.0, 1.0);
         if band_opacity <= 0.0 {
             continue;
         }
 
-        let r0 = t0 * radius;
-        let r1 = t1 * radius;
+        let r0 = if b == 0 {
+            0.0
+        } else {
+            (b as f64 * band_width_local - back_overlap_local).max(0.0)
+        };
+        let r1 = (b + 1) as f64 * band_width_local
+            + if b + 1 < bands { front_pad_local } else { 0.0 };
 
         let clipped = if b == 0 {
             let outer = circle_polygon_in_world(cx, cy, r1, &grad_to_world, 48);
@@ -762,7 +799,24 @@ fn emit_radial_gradient_bands(
 
         let valid = filter_valid_polygons(clipped);
         if !valid.0.is_empty() {
-            push_primitive(out, color, band_opacity, PrimitiveGeom::FilledPolygon(valid));
+            let r_nom0 = b as f64 * band_width;
+            let r_nom1 = (b + 1) as f64 * band_width;
+            let fade_in_r =
+                (b > 0).then_some((r_nom0 - 0.45 * band_width, r_nom0 + 0.18 * band_width));
+            let fade_out_r = (b + 1 < bands)
+                .then_some((r_nom1 + 0.04 * band_width, r_nom1 + 0.20 * band_width));
+            push_primitive_with_meta(
+                out,
+                color,
+                band_opacity,
+                PrimitiveGeom::FilledPolygon(valid),
+                Some(GradientFillMeta::Radial {
+                    center,
+                    band_width,
+                    fade_in_r,
+                    fade_out_r,
+                }),
+            );
         }
     }
 }
@@ -1132,5 +1186,114 @@ mod tests {
             }
             _ => panic!("expected filled polygons"),
         }
+
+        // Radial bands should carry Radial gradient metadata and proportional fade ranges.
+        match &prims[1].gradient_meta {
+            Some(GradientFillMeta::Radial {
+                band_width,
+                fade_in_r,
+                fade_out_r,
+                ..
+            }) => {
+                assert!(*band_width > 0.0);
+                let (fi_a, fi_b) = fade_in_r.expect("band 1 should fade in");
+                let (fo_a, fo_b) = fade_out_r.expect("band 1 should fade out");
+                assert!(((fi_b - fi_a) - 0.63 * band_width).abs() < 1e-6);
+                assert!(((fo_b - fo_a) - 0.16 * band_width).abs() < 1e-6);
+            }
+            other => panic!("expected Radial gradient meta on band 1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proportional_gradient_overlap_scales_with_bounds() {
+        let small_svg = br##"
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1000" width="1000" height="1000">
+            <defs>
+                <linearGradient id="g_small" x1="0" y1="0" x2="1" y2="0">
+                    <stop offset="0%" stop-color="#1B1035"/>
+                    <stop offset="100%" stop-color="#FFD166"/>
+                </linearGradient>
+            </defs>
+            <rect x="0" y="0" width="100" height="100" fill="url(#g_small)"/>
+            <rect x="500" y="500" width="50" height="50" fill="#00FF00"/>
+        </svg>"##;
+
+        let large_svg = br##"
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1000" width="1000" height="1000">
+            <defs>
+                <linearGradient id="g_large" x1="0" y1="0" x2="1" y2="0">
+                    <stop offset="0%" stop-color="#1B1035"/>
+                    <stop offset="100%" stop-color="#FFD166"/>
+                </linearGradient>
+            </defs>
+            <rect x="0" y="0" width="800" height="800" fill="url(#g_large)"/>
+        </svg>"##;
+
+        let cfg = IngestConfig::default();
+        let small_prims = ingest_svg(small_svg, &cfg).expect("ingest small gradient");
+        let large_prims = ingest_svg(large_svg, &cfg).expect("ingest large gradient");
+
+        assert_eq!(small_prims.len(), 6);
+        assert_eq!(large_prims.len(), 5);
+        assert!(small_prims[5].gradient_meta.is_none(), "non-gradient rect must have gradient_meta = None");
+
+        // Exact endpoint colors preserved on bands 0 and 4.
+        assert_eq!(small_prims[0].color_srgb, [0x1B, 0x10, 0x35]);
+        assert_eq!(small_prims[4].color_srgb, [0xFF, 0xD1, 0x66]);
+        assert_eq!(large_prims[0].color_srgb, [0x1B, 0x10, 0x35]);
+        assert_eq!(large_prims[4].color_srgb, [0xFF, 0xD1, 0x66]);
+
+        let measure_band_overlap = |prims: &[NormalizedPrimitive]| -> (f64, f64) {
+            let b0 = match &prims[0].geometry {
+                PrimitiveGeom::FilledPolygon(mp) => mp.bounding_rect().unwrap(),
+                _ => panic!("expected filled polygon"),
+            };
+            let b1 = match &prims[1].geometry {
+                PrimitiveGeom::FilledPolygon(mp) => mp.bounding_rect().unwrap(),
+                _ => panic!("expected filled polygon"),
+            };
+            let bw = match &prims[1].gradient_meta {
+                Some(GradientFillMeta::Linear {
+                    band_width,
+                    fade_in_s,
+                    fade_out_s,
+                    ..
+                }) => {
+                    let (fi_a, fi_b) = fade_in_s.expect("middle band must fade in");
+                    let (fo_a, fo_b) = fade_out_s.expect("middle band must fade out");
+                    assert!(((fi_a - 0.55 * band_width)).abs() < 1e-6);
+                    assert!(((fi_b - 1.18 * band_width)).abs() < 1e-6);
+                    assert!(((fo_a - 2.04 * band_width)).abs() < 1e-6);
+                    assert!(((fo_b - 2.20 * band_width)).abs() < 1e-6);
+                    *band_width
+                }
+                other => panic!("expected Linear gradient meta, got {other:?}"),
+            };
+            assert!(
+                matches!(
+                    &prims[0].gradient_meta,
+                    Some(GradientFillMeta::Linear { fade_in_s: None, fade_out_s: Some(_), .. })
+                ),
+                "first band should have fade_in_s = None"
+            );
+            assert!(
+                matches!(
+                    &prims[4].gradient_meta,
+                    Some(GradientFillMeta::Linear { fade_in_s: Some(_), fade_out_s: None, .. })
+                ),
+                "last band should have fade_out_s = None"
+            );
+            (bw, b0.max().x - b1.min().x)
+        };
+
+        let (small_bw, small_overlap) = measure_band_overlap(&small_prims);
+        let (large_bw, large_overlap) = measure_band_overlap(&large_prims);
+
+        // Large rect is 8x wider than small rect -> band_width and overlap must both scale 8x.
+        assert!((large_bw / small_bw - 8.0).abs() < 1e-4);
+        assert!((small_overlap - 0.65 * small_bw).abs() < 1e-5);
+        assert!((large_overlap - 0.65 * large_bw).abs() < 1e-5);
+        assert!((large_overlap / small_overlap - 8.0).abs() < 1e-3);
     }
 }

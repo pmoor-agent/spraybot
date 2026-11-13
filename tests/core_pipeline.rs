@@ -16,6 +16,9 @@ struct PipelineVerifyResult {
     duration: f64,
     saw_fat_spray: bool,
     saw_skinny_spray: bool,
+    max_fat_tilt_xy: f32,
+    max_skinny_tilt_xy: f32,
+    max_abs_wrist_yaw: f64,
 }
 
 fn verify_svg_end_to_end(rel_path: &str, max_cans: usize) -> PipelineVerifyResult {
@@ -89,6 +92,10 @@ fn verify_svg_end_to_end(rel_path: &str, max_cans: usize) -> PipelineVerifyResul
     let mut prev_frame: Option<RobotFrameState> = None;
     let mut saw_fat_spray = false;
     let mut saw_skinny_spray = false;
+    let mut saw_shaking = false;
+    let mut max_fat_tilt_xy = 0.0_f32;
+    let mut max_skinny_tilt_xy = 0.0_f32;
+    let mut max_abs_wrist_yaw = 0.0_f64;
 
     for i in 0..=step_count {
         let t = (i as f64 / sample_rate_hz).min(duration);
@@ -113,6 +120,15 @@ fn verify_svg_end_to_end(rel_path: &str, max_cans: usize) -> PipelineVerifyResul
         );
         assert!(frame.nozzle_world_pos.is_finite());
         assert!(frame.nozzle_world_dir.is_finite());
+        max_abs_wrist_yaw = max_abs_wrist_yaw.max(frame.joints[7].abs());
+
+        if frame.is_shaking {
+            saw_shaking = true;
+            assert!(
+                !frame.spray_active,
+                "{rel_path}: spray_active must be false during is_shaking at t={t:.3}"
+            );
+        }
 
         if let Some(s0) = prev_frame {
             if s0.spray_active && frame.spray_active {
@@ -128,9 +144,20 @@ fn verify_svg_end_to_end(rel_path: &str, max_cans: usize) -> PipelineVerifyResul
 
         if frame.spray_active {
             spray_count += 1;
+            let tilt_xy = frame.nozzle_world_dir.x.hypot(frame.nozzle_world_dir.y);
             match frame.active_cap {
-                NozzleCap::Fat => saw_fat_spray = true,
-                NozzleCap::Skinny => saw_skinny_spray = true,
+                NozzleCap::Fat => {
+                    saw_fat_spray = true;
+                    max_fat_tilt_xy = max_fat_tilt_xy.max(tilt_xy);
+                }
+                NozzleCap::Skinny => {
+                    saw_skinny_spray = true;
+                    max_skinny_tilt_xy = max_skinny_tilt_xy.max(tilt_xy);
+                    assert!(
+                        tilt_xy <= 0.12,
+                        "{rel_path}: Skinny active spray tilt_xy={tilt_xy:.4} > 0.12 at t={t:.3}"
+                    );
+                }
             }
             assert!(
                 frame.held_can_slot.is_some(),
@@ -171,11 +198,21 @@ fn verify_svg_end_to_end(rel_path: &str, max_cans: usize) -> PipelineVerifyResul
     }
 
     assert!(
+        saw_shaking,
+        "{rel_path}: expected at least one is_shaking == true sample during ShakeCan"
+    );
+    if saw_fat_spray {
+        assert!(
+            max_fat_tilt_xy > 0.14,
+            "{rel_path}: expected Fat active spray drag tilt > 0.14, got max_fat_tilt_xy={max_fat_tilt_xy:.4}"
+        );
+    }
+    assert!(
         spray_count > 10,
         "{rel_path}: expected substantial active spray samples, got {spray_count}"
     );
     println!(
-        "{rel_path}: timeline.duration() = {duration:.2}s ({} ops, {} samples @ 60 Hz, {spray_count} active spray samples)",
+        "{rel_path}: timeline.duration() = {duration:.2}s ({} ops, {} samples @ 60 Hz, {spray_count} active spray samples, max_fat_tilt_xy={max_fat_tilt_xy:.4}, max_skinny_tilt_xy={max_skinny_tilt_xy:.4}, max_abs_wrist_yaw={max_abs_wrist_yaw:.4})",
         job.ops.len(),
         step_count + 1
     );
@@ -186,6 +223,9 @@ fn verify_svg_end_to_end(rel_path: &str, max_cans: usize) -> PipelineVerifyResul
         duration,
         saw_fat_spray,
         saw_skinny_spray,
+        max_fat_tilt_xy,
+        max_skinny_tilt_xy,
+        max_abs_wrist_yaw,
     }
 }
 
@@ -214,6 +254,21 @@ fn core_pipeline_02_street_art_poster() {
         "02_street_art_poster.svg: expected both Fat and Skinny active spray samples (fat={}, skinny={})",
         res.saw_fat_spray,
         res.saw_skinny_spray
+    );
+    assert!(
+        res.max_fat_tilt_xy > 0.14,
+        "02_street_art_poster.svg: expected Fat active spray drag tilt > 0.14, got {:.4}",
+        res.max_fat_tilt_xy
+    );
+    assert!(
+        res.max_skinny_tilt_xy <= 0.12,
+        "02_street_art_poster.svg: expected Skinny active spray tilt <= 0.12, got {:.4}",
+        res.max_skinny_tilt_xy
+    );
+    assert!(
+        res.max_abs_wrist_yaw > 0.05,
+        "02_street_art_poster.svg: expected nonzero wrist_yaw (joints[7]) usage, got max_abs={:.6}",
+        res.max_abs_wrist_yaw
     );
     let gradient_count = res
         .primitives

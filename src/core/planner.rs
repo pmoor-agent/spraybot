@@ -237,6 +237,187 @@ fn plan_multipolygon(
     }
 }
 
+fn isoperimetric_quotient(poly: &Polygon<f64>) -> f64 {
+    let perim_len = poly.exterior().length(&geo::Euclidean);
+    if perim_len <= 1e-9 {
+        return 0.0;
+    }
+    let area = poly.unsigned_area();
+    (4.0 * std::f64::consts::PI * area) / (perim_len * perim_len)
+}
+
+fn ring_needs_hole_pass(ext: &LineString<f64>, hole: &LineString<f64>, max_gap: f64) -> bool {
+    let max_gap_sq = max_gap * max_gap;
+    hole.coords().any(|hc| {
+        let hp = DVec2::new(hc.x, hc.y);
+        let mut min_d_sq = f64::INFINITY;
+        for w in ext.0.windows(2) {
+            let a = DVec2::new(w[0].x, w[0].y);
+            let b = DVec2::new(w[1].x, w[1].y);
+            let ab = b - a;
+            let len_sq = ab.length_squared();
+            let t = if len_sq > 1e-18 {
+                ((hp - a).dot(ab) / len_sq).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            min_d_sq = min_d_sq.min((a + ab * t).distance_squared(hp));
+        }
+        min_d_sq > max_gap_sq
+    })
+}
+
+fn emit_medial_core_between(
+    poly: &Polygon<f64>,
+    lo_offset: f64,
+    hi_offset: f64,
+    standoff: f32,
+    spot_w: f64,
+    flow: f32,
+    cap: NozzleCap,
+    config: &PlannerConfig,
+    out: &mut Vec<JobOp>,
+) {
+    let mut lo = lo_offset;
+    let mut hi = hi_offset;
+    let mut best_core = poly.buffer(-lo);
+    if best_core.0.is_empty() || best_core.unsigned_area() <= 1e-9 {
+        return;
+    }
+    for _ in 0..8 {
+        let mid = 0.5 * (lo + hi);
+        if mid - lo < 1e-5 {
+            break;
+        }
+        let inset = poly.buffer(-mid);
+        if !inset.0.is_empty() && inset.unsigned_area() > 1e-9 {
+            best_core = inset;
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+
+    for core_poly in &best_core.0 {
+        if core_poly.exterior().length(&geo::Euclidean) < 1e-5 {
+            continue;
+        }
+        emit_ring_stroke(core_poly.exterior(), standoff, flow, cap, config, out);
+        for hole in core_poly.interiors() {
+            if hole.length(&geo::Euclidean) >= 1e-5
+                && ring_needs_hole_pass(core_poly.exterior(), hole, 0.35 * spot_w)
+            {
+                emit_ring_stroke(hole, standoff, flow, cap, config, out);
+            }
+        }
+    }
+}
+
+/// Peels concentric contour-offset rings inward from the perimeter pass, bridging any
+/// narrow residual centerlines with a medial pass and handing off large hole-free cores
+/// to boustrophedon hatching with tight overlap.
+#[allow(clippy::too_many_arguments)]
+fn plan_concentric_infill(
+    poly: &Polygon<f64>,
+    perim_mp: &MultiPolygon<f64>,
+    inset_perim: f64,
+    d_perim: f32,
+    w_perim: f64,
+    max_concentric_rings: usize,
+    opacity: f32,
+    cap: NozzleCap,
+    config: &PlannerConfig,
+    out: &mut Vec<JobOp>,
+) {
+    let fill_flow = flow_scale_for_target_alpha(opacity, 3.6);
+    let (d_fill_min, d_fill_max) = match cap {
+        NozzleCap::Fat => (0.08_f32, 0.20_f32),
+        NozzleCap::Skinny => (0.045_f32, 0.12_f32),
+    };
+    let tan_theta = cap.cone_half_angle_rad().tan() as f64;
+
+    let mut prev_offset = inset_perim;
+    let mut prev_d = d_perim;
+    let mut prev_w = w_perim;
+    let mut rings_emitted = 0usize;
+    const MAX_SAFETY_RINGS: usize = 48;
+
+    for ring_idx in 1..=MAX_SAFETY_RINGS {
+        let step_ratio = if ring_idx == 1 { 0.42 } else { 0.50 };
+        let offset = prev_offset + step_ratio * prev_w;
+        let ring_mp = filter_valid_mp(poly.buffer(-offset));
+
+        if ring_mp.0.is_empty() {
+            let half_gap_offset = prev_offset + 0.275 * prev_w;
+            emit_medial_core_between(
+                poly,
+                half_gap_offset,
+                offset,
+                prev_d,
+                prev_w,
+                fill_flow,
+                cap,
+                config,
+                out,
+            );
+            return;
+        }
+
+        let d_safe_max = (offset / (0.48 * 2.0 * tan_theta)) as f32;
+        let d_k = if d_safe_max >= d_fill_min {
+            d_safe_max.clamp(d_fill_min, d_fill_max)
+        } else {
+            d_safe_max.clamp(d_perim, d_fill_max)
+        };
+        let w_k = spot_width_cap(cap, d_k) as f64;
+
+        for p in &ring_mp.0 {
+            emit_ring_stroke(p.exterior(), d_k, fill_flow, cap, config, out);
+            for hole in p.interiors() {
+                emit_ring_stroke(hole, d_k, fill_flow, cap, config, out);
+            }
+        }
+
+        prev_offset = offset;
+        prev_d = d_k;
+        prev_w = w_k;
+        rings_emitted += 1;
+
+        if rings_emitted >= max_concentric_rings {
+            let handoff_offset = prev_offset + 0.32 * prev_w;
+            let remaining = filter_valid_mp(poly.buffer(-handoff_offset));
+            if remaining.0.is_empty() {
+                let half_gap_offset = prev_offset + 0.275 * prev_w;
+                emit_medial_core_between(
+                    poly,
+                    half_gap_offset,
+                    handoff_offset,
+                    prev_d,
+                    prev_w,
+                    fill_flow,
+                    cap,
+                    config,
+                    out,
+                );
+                return;
+            }
+            if remaining.0.iter().all(|p| p.interiors().is_empty()) {
+                let max_safe_d = ((handoff_offset / (0.45 * 2.0 * tan_theta)) as f32).max(d_perim);
+                plan_boustrophedon_hatch_bounded(
+                    &remaining,
+                    perim_mp,
+                    opacity,
+                    cap,
+                    config,
+                    Some(max_safe_d),
+                    out,
+                );
+                return;
+            }
+        }
+    }
+}
+
 fn plan_single_polygon(
     poly: &Polygon<f64>,
     opacity: f32,
@@ -286,12 +467,22 @@ fn plan_single_polygon(
         }
     }
 
-    // 2. Interior boustrophedon zig-zag hatch: inset further by 0.6 * w_perim.
-    let inset_hatch = inset_perim + 0.6 * w_perim;
-    let hatch_mp = filter_valid_mp(poly.buffer(-inset_hatch));
-    if !hatch_mp.0.is_empty() {
-        plan_boustrophedon_hatch(&hatch_mp, &perim_mp, opacity, cap, config, out);
-    }
+    // 2. Concentric contour-offset infill (full pocket for holed/circular shapes, 1 seam-bridging
+    //    peel + medial/boustrophedon handoff for general elongated/polygonal shapes).
+    let use_full_concentric = !poly.interiors().is_empty() || isoperimetric_quotient(poly) >= 0.60;
+    let max_concentric_rings = if use_full_concentric { 4 } else { 1 };
+    plan_concentric_infill(
+        poly,
+        &perim_mp,
+        inset_perim,
+        d_perim,
+        w_perim,
+        max_concentric_rings,
+        opacity,
+        cap,
+        config,
+        out,
+    );
 }
 
 /// Plans airbrushed gradient bands using wide `Fat` cap scanlines with zero perimeter strokes.
@@ -313,7 +504,7 @@ fn plan_gradient_multipolygon(
             let d_fill = ((*band_width as f32 * 0.45)
                 / (2.0 * NozzleCap::Fat.cone_half_angle_rad().tan()))
             .clamp(0.12, 0.25);
-            let step_over = (0.62 * spot_width_cap(NozzleCap::Fat, d_fill) as f64).max(0.012);
+            let step_over = (0.54 * spot_width_cap(NozzleCap::Fat, d_fill) as f64).max(0.012);
             let perp = DVec2::new(-dir.y, dir.x);
 
             for poly in &mp.0 {
@@ -356,48 +547,192 @@ fn plan_gradient_multipolygon(
             let d_fill = ((*band_width as f32 * 0.45)
                 / (2.0 * NozzleCap::Fat.cone_half_angle_rad().tan()))
             .clamp(0.12, 0.25);
-            let step_over = (0.62 * spot_width_cap(NozzleCap::Fat, d_fill) as f64).max(0.012);
+            let step_over = (0.54 * spot_width_cap(NozzleCap::Fat, d_fill) as f64).max(0.012);
 
             for poly in &mp.0 {
                 if poly.unsigned_area() < MIN_AREA_M2 {
                     continue;
                 }
-                let Some(bbox) = poly.bounding_rect() else {
+                let (r_min, r_max) = radial_bounds(poly, *center);
+                if r_max <= r_min + 1e-5 {
                     continue;
-                };
-                let (step_dir, scan_dir) = if bbox.width() >= bbox.height() {
-                    (DVec2::Y, DVec2::X)
+                }
+
+                let mut radii: Vec<f64> = Vec::new();
+                let r_start = r_min + 0.35 * step_over;
+                if r_start >= r_max {
+                    radii.push((0.5 * (r_min + r_max)).max(0.005));
                 } else {
-                    (DVec2::X, DVec2::Y)
-                };
+                    let mut r_cur = r_start;
+                    while r_cur < r_max - 1e-5 {
+                        radii.push(r_cur);
+                        r_cur += step_over;
+                    }
+                    if let Some(&last_r) = radii.last() {
+                        if r_max - last_r > 0.55 * step_over {
+                            radii.push((r_max - 0.30 * step_over).max(last_r + 1e-4));
+                        }
+                    }
+                }
+
                 let poly_mp = MultiPolygon::new(vec![poly.clone()]);
-                let chains = build_oriented_boustrophedon_polylines(
-                    &poly_mp,
-                    &poly_mp,
-                    DVec2::ZERO,
-                    step_dir,
-                    scan_dir,
-                    step_over,
-                    Some(0.015),
-                );
-                for chain in chains {
-                    let pts_with_op: Vec<(DVec2, f32)> = chain
-                        .into_iter()
-                        .map(|pt| {
-                            let r = pt.distance(*center);
-                            let w_in = fade_in_r
-                                .map_or(1.0, |(a, b)| 0.04 + 0.96 * smoothstep(a, b, r));
-                            let w_out =
-                                fade_out_r.map_or(1.0, |(a, b)| 1.0 - 0.55 * smoothstep(a, b, r));
-                            let target_alpha = (opacity * (w_in * w_out) as f32).clamp(0.02, 1.0);
-                            (pt, flow_scale_for_target_alpha(target_alpha, 4.2))
-                        })
-                        .collect();
-                    emit_polyline_stroke(&pts_with_op, d_fill, NozzleCap::Fat, config, out);
+                let mut emitted_any = false;
+                for r in radii {
+                    if r < 1e-4 {
+                        continue;
+                    }
+                    let n_seg =
+                        ((2.0 * std::f64::consts::PI * r) / 0.012).ceil().max(16.0) as usize;
+                    let mut coords = Vec::with_capacity(n_seg + 1);
+                    for k in 0..=n_seg {
+                        let theta = (k % n_seg) as f64 * (2.0 * std::f64::consts::PI / n_seg as f64);
+                        coords.push(Coord {
+                            x: center.x + r * theta.cos(),
+                            y: center.y + r * theta.sin(),
+                        });
+                    }
+                    let circle_mls = MultiLineString::new(vec![LineString::new(coords)]);
+                    let clipped = poly_mp.clip(&circle_mls, false);
+                    let chains = merge_clipped_circle_chains(clipped.0);
+                    for chain in chains {
+                        if chain.len() < 2 {
+                            continue;
+                        }
+                        let pts_with_op: Vec<(DVec2, f32)> = chain
+                            .into_iter()
+                            .map(|pt| {
+                                let dist = pt.distance(*center);
+                                let w_in = fade_in_r
+                                    .map_or(1.0, |(a, b)| 0.04 + 0.96 * smoothstep(a, b, dist));
+                                let w_out = fade_out_r
+                                    .map_or(1.0, |(a, b)| 1.0 - 0.55 * smoothstep(a, b, dist));
+                                let target_alpha =
+                                    (opacity * (w_in * w_out) as f32).clamp(0.02, 1.0);
+                                (pt, flow_scale_for_target_alpha(target_alpha, 4.2))
+                            })
+                            .collect();
+                        let prev_len = out.len();
+                        emit_polyline_stroke(&pts_with_op, d_fill, NozzleCap::Fat, config, out);
+                        if out.len() > prev_len {
+                            emitted_any = true;
+                        }
+                    }
+                }
+
+                // Degenerate radial sliver fallback: preserve coverage with dense subdivided scanlines.
+                if !emitted_any {
+                    if let Some(bbox) = poly.bounding_rect() {
+                        let (step_dir, scan_dir) = if bbox.width() >= bbox.height() {
+                            (DVec2::Y, DVec2::X)
+                        } else {
+                            (DVec2::X, DVec2::Y)
+                        };
+                        let chains = build_oriented_boustrophedon_polylines(
+                            &poly_mp,
+                            &poly_mp,
+                            DVec2::ZERO,
+                            step_dir,
+                            scan_dir,
+                            step_over,
+                            Some(0.015),
+                        );
+                        for chain in chains {
+                            let pts_with_op: Vec<(DVec2, f32)> = chain
+                                .into_iter()
+                                .map(|pt| {
+                                    let dist = pt.distance(*center);
+                                    let w_in = fade_in_r
+                                        .map_or(1.0, |(a, b)| 0.04 + 0.96 * smoothstep(a, b, dist));
+                                    let w_out = fade_out_r
+                                        .map_or(1.0, |(a, b)| 1.0 - 0.55 * smoothstep(a, b, dist));
+                                    let target_alpha =
+                                        (opacity * (w_in * w_out) as f32).clamp(0.02, 1.0);
+                                    (pt, flow_scale_for_target_alpha(target_alpha, 4.2))
+                                })
+                                .collect();
+                            emit_polyline_stroke(&pts_with_op, d_fill, NozzleCap::Fat, config, out);
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+fn min_dist_to_ring(pt: DVec2, ring: &LineString<f64>) -> f64 {
+    let mut min_d_sq = f64::INFINITY;
+    for w in ring.0.windows(2) {
+        let a = DVec2::new(w[0].x, w[0].y);
+        let b = DVec2::new(w[1].x, w[1].y);
+        let ab = b - a;
+        let len_sq = ab.length_squared();
+        let t = if len_sq > 1e-18 {
+            ((pt - a).dot(ab) / len_sq).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        min_d_sq = min_d_sq.min((a + ab * t).distance_squared(pt));
+    }
+    min_d_sq.sqrt()
+}
+
+fn radial_bounds(poly: &Polygon<f64>, center: DVec2) -> (f64, f64) {
+    let r_max = poly
+        .exterior()
+        .coords()
+        .map(|c| DVec2::new(c.x, c.y).distance(center))
+        .fold(0.0_f64, f64::max);
+    let r_min = if poly.contains(&geo::Point::new(center.x, center.y)) {
+        0.0
+    } else {
+        let mut d = min_dist_to_ring(center, poly.exterior());
+        for hole in poly.interiors() {
+            d = d.min(min_dist_to_ring(center, hole));
+        }
+        d
+    };
+    (r_min, r_max)
+}
+
+fn merge_clipped_circle_chains(lines: Vec<LineString<f64>>) -> Vec<Vec<DVec2>> {
+    let mut chains: Vec<Vec<DVec2>> = lines
+        .into_iter()
+        .filter_map(|ls| {
+            let pts: Vec<DVec2> = ls.coords().map(|c| DVec2::new(c.x, c.y)).collect();
+            (pts.len() >= 2).then_some(pts)
+        })
+        .collect();
+    if chains.len() < 2 {
+        return chains;
+    }
+
+    let mut merged = true;
+    while merged {
+        merged = false;
+        'outer: for i in 0..chains.len() {
+            if chains[i].len() >= 3 && chains[i].first().unwrap().distance(*chains[i].last().unwrap()) < 1e-4 {
+                continue;
+            }
+            for j in 0..chains.len() {
+                if i == j {
+                    continue;
+                }
+                if chains[j].len() >= 3 && chains[j].first().unwrap().distance(*chains[j].last().unwrap()) < 1e-4 {
+                    continue;
+                }
+                let end_i = *chains[i].last().unwrap();
+                let start_j = *chains[j].first().unwrap();
+                if end_i.distance(start_j) < 1e-4 {
+                    let tail = chains.remove(j);
+                    let dst_idx = if j < i { i - 1 } else { i };
+                    chains[dst_idx].extend(tail.into_iter().skip(1));
+                    merged = true;
+                    break 'outer;
+                }
+            }
+        }
+    }
+    chains
 }
 
 fn emit_ring_stroke(
@@ -412,12 +747,25 @@ fn emit_ring_stroke(
     emit_uniform_polyline_stroke(&pts, standoff, opacity_scale, cap, config, out);
 }
 
+#[allow(dead_code)]
 fn plan_boustrophedon_hatch(
     hatch_mp: &MultiPolygon<f64>,
     containment_mp: &MultiPolygon<f64>,
     opacity: f32,
     cap: NozzleCap,
     config: &PlannerConfig,
+    out: &mut Vec<JobOp>,
+) {
+    plan_boustrophedon_hatch_bounded(hatch_mp, containment_mp, opacity, cap, config, None, out);
+}
+
+fn plan_boustrophedon_hatch_bounded(
+    hatch_mp: &MultiPolygon<f64>,
+    containment_mp: &MultiPolygon<f64>,
+    opacity: f32,
+    cap: NozzleCap,
+    config: &PlannerConfig,
+    max_d_fill: Option<f32>,
     out: &mut Vec<JobOp>,
 ) {
     let Some(bbox) = hatch_mp.bounding_rect() else {
@@ -428,10 +776,13 @@ fn plan_boustrophedon_hatch(
     let height = bbox.height();
     let minor_dim = width.min(height) as f32;
 
-    let (d_fill_min, d_fill_max) = match cap {
+    let (d_fill_min, d_fill_max_cap) = match cap {
         NozzleCap::Fat => (0.08_f32, 0.22_f32),
         NozzleCap::Skinny => (0.045_f32, 0.14_f32),
     };
+    let d_fill_max = max_d_fill
+        .map(|d| d.clamp(d_fill_min, d_fill_max_cap))
+        .unwrap_or(d_fill_max_cap);
     let w_fill_min = spot_width_cap(cap, d_fill_min);
     let w_fill_max = spot_width_cap(cap, d_fill_max);
     let target_w = (minor_dim * 0.35).clamp(w_fill_min, w_fill_max);
@@ -462,6 +813,10 @@ fn plan_boustrophedon_hatch(
         step_over,
         None,
     );
+    if chains.is_empty() && hatch_mp.unsigned_area() >= MIN_AREA_M2 {
+        plan_thin_sliver_medial(hatch_mp, opacity, cap, config, 0, out);
+        return;
+    }
     let hatch_flow = flow_scale_for_target_alpha(opacity, 4.2);
     for chain in chains {
         emit_uniform_polyline_stroke(&chain, d_fill, hatch_flow, cap, config, out);
@@ -770,14 +1125,24 @@ fn emit_uniform_polyline_stroke(
 }
 
 /// Computes per-vertex arc-length-smoothed forward unit 2D tangents over a ~0.025m radius window
-/// so sharp corners and boustrophedon turnarounds transition smoothly without wrist snaps.
-fn compute_smoothed_tangents(pts: &[(DVec2, f32)], window_radius: f64) -> Vec<DVec2> {
+/// so sharp corners, closed contour loops, and turnarounds transition smoothly without wrist snaps.
+fn compute_smoothed_tangents(
+    pts: &[(DVec2, f32)],
+    window_radius: f64,
+    is_closed: bool,
+) -> Vec<DVec2> {
     let n = pts.len();
     let mut s = Vec::with_capacity(n);
     s.push(0.0_f64);
     for i in 1..n {
         s.push(s[i - 1] + pts[i].0.distance(pts[i - 1].0));
     }
+    let total_len = s[n - 1];
+    let eff_radius = if is_closed {
+        window_radius.min(0.35 * total_len).max(1e-6)
+    } else {
+        window_radius
+    };
 
     let seg_dirs: Vec<DVec2> = pts
         .windows(2)
@@ -787,28 +1152,43 @@ fn compute_smoothed_tangents(pts: &[(DVec2, f32)], window_radius: f64) -> Vec<DV
     let mut tangents = Vec::with_capacity(n);
     for i in 0..n {
         let si = s[i];
-        let lo = si - window_radius;
-        let hi = si + window_radius;
+        let lo = si - eff_radius;
+        let hi = si + eff_radius;
         let mut acc = DVec2::ZERO;
 
-        for (j, &dir) in seg_dirs.iter().enumerate() {
-            let a = s[j];
-            let b = s[j + 1];
-            if b <= lo || a >= hi {
-                continue;
+        let shifts: &[f64] = if is_closed {
+            &[-total_len, 0.0, total_len]
+        } else {
+            &[0.0]
+        };
+
+        for &shift in shifts {
+            for (j, &dir) in seg_dirs.iter().enumerate() {
+                let a = s[j] + shift;
+                let b = s[j + 1] + shift;
+                if b <= lo || a >= hi {
+                    continue;
+                }
+                let u0 = (a - si).clamp(-eff_radius, eff_radius);
+                let u1 = (b - si).clamp(-eff_radius, eff_radius);
+                if u1 <= u0 {
+                    continue;
+                }
+                // Exact integral of tent kernel (1 - |u|/R) over [u0, u1].
+                let weight = (u1 - u0) - (u1 * u1.abs() - u0 * u0.abs()) / (2.0 * eff_radius);
+                acc += dir * weight.max(0.0);
             }
-            let u0 = (a - si).clamp(-window_radius, window_radius);
-            let u1 = (b - si).clamp(-window_radius, window_radius);
-            if u1 <= u0 {
-                continue;
-            }
-            // Exact integral of tent kernel (1 - |u|/R) over [u0, u1].
-            let weight = (u1 - u0) - (u1 * u1.abs() - u0 * u0.abs()) / (2.0 * window_radius);
-            acc += dir * weight.max(0.0);
         }
 
         let unit = if acc.length_squared() > 1e-10 {
             acc.normalize()
+        } else if is_closed && (i == 0 || i == n - 1) {
+            let sum = seg_dirs[seg_dirs.len() - 1] + seg_dirs[0];
+            if sum.length_squared() > 1e-10 {
+                sum.normalize()
+            } else {
+                seg_dirs[0]
+            }
         } else if i == 0 {
             seg_dirs[0]
         } else if i == n - 1 {
@@ -893,7 +1273,8 @@ fn emit_polyline_stroke(
         return;
     }
 
-    let tangents = compute_smoothed_tangents(&pts, 0.025);
+    let is_closed = pts.len() >= 4 && pts[0].0.distance(pts[pts.len() - 1].0) < 1e-4;
+    let tangents = compute_smoothed_tangents(&pts, 0.025, is_closed);
     let feed_speed = compensated_feed_speed_cap(config, cap, standoff);
     let lead = config.lead_length as f64;
     let lead_in_pt = pts[0].0 - start_dir * lead;
@@ -1598,5 +1979,326 @@ mod tests {
         }
         assert!(saw_tilted_fat, "expected tilted Fat strokes in poster job");
         assert!(saw_tilted_skinny, "expected tilted Skinny strokes in poster job");
+    }
+
+    fn circle_ring(cx: f64, cy: f64, r: f64, n: usize, ccw: bool) -> LineString<f64> {
+        let mut coords = Vec::with_capacity(n + 1);
+        for i in 0..=n {
+            let k = if ccw { i % n } else { (n - (i % n)) % n };
+            let theta = k as f64 * (2.0 * std::f64::consts::PI / n as f64);
+            coords.push(Coord {
+                x: cx + r * theta.cos(),
+                y: cy + r * theta.sin(),
+            });
+        }
+        LineString::new(coords)
+    }
+
+    fn rect_ring(x0: f64, y0: f64, x1: f64, y1: f64, ccw: bool) -> LineString<f64> {
+        if ccw {
+            LineString::new(vec![
+                Coord { x: x0, y: y0 },
+                Coord { x: x1, y: y0 },
+                Coord { x: x1, y: y1 },
+                Coord { x: x0, y: y1 },
+                Coord { x: x0, y: y0 },
+            ])
+        } else {
+            LineString::new(vec![
+                Coord { x: x0, y: y0 },
+                Coord { x: x0, y: y1 },
+                Coord { x: x1, y: y1 },
+                Coord { x: x1, y: y0 },
+                Coord { x: x0, y: y0 },
+            ])
+        }
+    }
+
+    fn rasterize_job_to_canvas(
+        prims: &[NormalizedPrimitive],
+        cfg: &PlannerConfig,
+        width: u32,
+        height: u32,
+    ) -> (JobPlan, crate::sim::canvas::CanvasPaintBuffer) {
+        use crate::core::kinematics::KinematicChain;
+        use crate::core::trajectory::CompiledTimeline;
+        use crate::core::types::StudioConfig;
+        use crate::sim::canvas::CanvasPaintBuffer;
+
+        let studio = StudioConfig::default();
+        let chain = KinematicChain::default_spraybot(&studio);
+        let palette = quantize_palette(prims, 16, 42);
+        let batches = batch_primitives(prims, &palette, &BatchConfig::default());
+        let job = plan_job(prims, &palette, &batches, cfg);
+        let timeline = CompiledTimeline::compile(&job, &chain, &studio)
+            .expect("trajectory compile for raster test");
+
+        let mut buf = CanvasPaintBuffer::new(
+            width,
+            height,
+            studio.canvas_center,
+            studio.canvas_width,
+            studio.canvas_height,
+            42,
+        );
+        buf.deposit_timeline_interval(&timeline, &palette, 0.0, timeline.duration());
+        (job, buf)
+    }
+
+    fn sample_coverage(
+        buf: &crate::sim::canvas::CanvasPaintBuffer,
+        x: f32,
+        y: f32,
+        paint_srgb: [u8; 3],
+    ) -> f32 {
+        let (px, py) = buf
+            .world_to_pixel(glam::Vec2::new(x, y))
+            .expect("sample point within canvas bounds");
+        let idx = (py as usize) * (buf.width as usize) + (px as usize);
+        let luma = |rgb: [f32; 3]| 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+        let gesso = luma(buf.gesso_linear);
+        let paint = luma(crate::sim::canvas::srgb_u8_to_linear_rgb(paint_srgb));
+        let denom = (gesso - paint).max(1e-5);
+        ((gesso - luma(buf.linear_rgb[idx])) / denom).clamp(0.0, 1.0)
+    }
+
+    #[test]
+    fn circular_annulus_uses_concentric_rings_with_solid_polar_coverage() {
+        let cx = 0.0_f64;
+        let cy = 1.55_f64;
+        let r_out = 0.25_f64;
+        let r_in = 0.20_f64;
+        let paint_srgb = [15, 25, 45];
+        let annulus = Polygon::new(
+            circle_ring(cx, cy, r_out, 72, true),
+            vec![circle_ring(cx, cy, r_in, 72, false)],
+        );
+        let prim = NormalizedPrimitive {
+            id: 0,
+            color_srgb: paint_srgb,
+            opacity: 1.0,
+            geometry: PrimitiveGeom::FilledPolygon(MultiPolygon::new(vec![annulus.clone()])),
+            gradient_meta: None,
+        };
+        let cfg = PlannerConfig::default();
+
+        // Compare op count against horizontal boustrophedon infill on the same annulus.
+        let inset_old = 1.05 * spot_width_cap(NozzleCap::Fat, cfg.d_perimeter) as f64;
+        let old_hatch_mp = filter_valid_mp(annulus.buffer(-inset_old));
+        let mut old_hatch_ops = Vec::new();
+        plan_boustrophedon_hatch(
+            &old_hatch_mp,
+            &MultiPolygon::new(vec![annulus.clone()]),
+            1.0,
+            NozzleCap::Fat,
+            &cfg,
+            &mut old_hatch_ops,
+        );
+        let boustrophedon_total_strokes = 2 + old_hatch_ops.len();
+
+        let (job, buf) = rasterize_job_to_canvas(&[prim], &cfg, 1024, 614);
+        let strokes: Vec<&Vec<StrokeWaypoint>> = job
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                JobOp::PaintStroke { points_canvas_3d } => Some(points_canvas_3d),
+                _ => None,
+            })
+            .collect();
+
+        println!(
+            "Annulus stroke comparison: concentric={} strokes vs boustrophedon={} strokes",
+            strokes.len(),
+            boustrophedon_total_strokes
+        );
+        assert!(
+            strokes.len() <= 6,
+            "5cm annulus should plan <= 6 smooth concentric strokes, got {}",
+            strokes.len()
+        );
+        assert!(
+            strokes.len() * 2 < boustrophedon_total_strokes,
+            "concentric ({}) should use < 1/2 the strokes of boustrophedon ({})",
+            strokes.len(),
+            boustrophedon_total_strokes
+        );
+
+        // Verify every concentric ring closes smoothly with wraparound drag-tilt continuity.
+        for wps in &strokes {
+            let active = &wps[1..wps.len() - 1];
+            assert!(active.len() >= 16);
+            let closure_gap = active.first().unwrap().pos.distance(active.last().unwrap().pos);
+            assert!(
+                closure_gap < 1e-4,
+                "concentric ring did not close cleanly: gap={closure_gap}"
+            );
+            let aim_jump = active
+                .first()
+                .unwrap()
+                .aim_dir
+                .distance(active.last().unwrap().aim_dir);
+            assert!(
+                aim_jump < 1e-4,
+                "closed ring wraparound aim_dir jumped by {aim_jump}"
+            );
+        }
+
+        // Verify rasterized coverage around all 360 degrees (specifically North & South poles) and across ring width.
+        for deg in (0..360).step_by(5) {
+            let rad = (deg as f32).to_radians();
+            for r in [0.212_f32, 0.225_f32, 0.238_f32] {
+                let x = cx as f32 + r * rad.cos();
+                let y = cy as f32 + r * rad.sin();
+                let cov = sample_coverage(&buf, x, y, paint_srgb);
+                assert!(
+                    cov > 0.88,
+                    "annulus gap at deg={deg}, r={r:.3} ({x:.3}, {y:.3}): coverage={cov:.3}"
+                );
+            }
+        }
+        assert!(
+            sample_coverage(&buf, cx as f32, cy as f32, paint_srgb) < 0.02,
+            "interior hole center must stay clean"
+        );
+        assert!(
+            sample_coverage(&buf, cx as f32, (cy + 0.30) as f32, paint_srgb) < 0.02,
+            "exterior outside annulus must stay clean"
+        );
+    }
+
+    #[test]
+    fn holed_shield_and_fcz_stems_have_zero_contour_hatch_halo() {
+        let cx = 0.0_f64;
+        let cy = 1.55_f64;
+        let paint_srgb = [15, 30, 80];
+        // FCZ-like holed circle shield: r=0.22m minus two vertical rectangular cutouts and a crossbar cutout.
+        let outer = circle_ring(cx, cy, 0.22, 64, true);
+        let hole_left = rect_ring(cx - 0.11, cy - 0.10, cx - 0.04, cy + 0.10, false);
+        let hole_right = rect_ring(cx + 0.04, cy - 0.10, cx + 0.11, cy + 0.10, false);
+        let shield = Polygon::new(outer, vec![hole_left, hole_right]);
+
+        // Medium Fat-cap F-like stem (3.4cm wide, right where old inset_hatch vanished) + thin Skinny-cap Z-like stem (6mm wide).
+        let fat_stem = Polygon::new(rect_ring(0.32, 1.40, 0.354, 1.70, true), Vec::new());
+        let skinny_stem = Polygon::new(rect_ring(0.42, 1.45, 0.426, 1.65, true), Vec::new());
+
+        let prims = vec![
+            NormalizedPrimitive {
+                id: 0,
+                color_srgb: paint_srgb,
+                opacity: 1.0,
+                geometry: PrimitiveGeom::FilledPolygon(MultiPolygon::new(vec![shield])),
+                gradient_meta: None,
+            },
+            NormalizedPrimitive {
+                id: 1,
+                color_srgb: paint_srgb,
+                opacity: 1.0,
+                geometry: PrimitiveGeom::FilledPolygon(MultiPolygon::new(vec![
+                    fat_stem,
+                    skinny_stem,
+                ])),
+                gradient_meta: None,
+            },
+        ];
+
+        let cfg = PlannerConfig::default();
+        let (_job, buf) = rasterize_job_to_canvas(&prims, &cfg, 1024, 614);
+
+        // Check shield outer frame (north, south, west, east) & central vertical bridge between the two holes.
+        for &(sx, sy, label) in &[
+            (0.0_f32, 1.71_f32, "shield north frame"),
+            (0.0_f32, 1.39_f32, "shield south frame"),
+            (-0.165_f32, 1.55_f32, "shield west arc"),
+            (0.165_f32, 1.55_f32, "shield east arc"),
+            (0.0_f32, 1.55_f32, "shield center bridge"),
+            (0.0_f32, 1.62_f32, "shield upper bridge"),
+            (0.0_f32, 1.48_f32, "shield lower bridge"),
+            (0.337_f32, 1.55_f32, "3.4cm Fat stem center"),
+            (0.337_f32, 1.64_f32, "3.4cm Fat stem upper"),
+            (0.423_f32, 1.55_f32, "6mm Skinny stem center"),
+        ] {
+            let cov = sample_coverage(&buf, sx, sy, paint_srgb);
+            assert!(
+                cov > 0.85,
+                "white halo / gap at {label} ({sx:.3}, {sy:.3}): coverage={cov:.3}"
+            );
+        }
+
+        // Interior cutouts must remain unpainted.
+        assert!(
+            sample_coverage(&buf, -0.075, 1.55, paint_srgb) < 0.05,
+            "left shield cutout must stay clean"
+        );
+        assert!(
+            sample_coverage(&buf, 0.075, 1.55, paint_srgb) < 0.05,
+            "right shield cutout must stay clean"
+        );
+    }
+
+    #[test]
+    fn radial_gradient_bands_plan_concentric_arcs_with_solid_coverage() {
+        let center = DVec2::new(0.0, 1.55);
+        let paint_srgb = [20, 40, 160];
+        // 1. Verify radial annulus band emits smooth concentric circular strokes.
+        let band_poly = Polygon::new(
+            circle_ring(center.x, center.y, 0.22, 64, true),
+            vec![circle_ring(center.x, center.y, 0.10, 64, false)],
+        );
+        let prim_band = NormalizedPrimitive {
+            id: 0,
+            color_srgb: paint_srgb,
+            opacity: 1.0,
+            geometry: PrimitiveGeom::FilledPolygon(MultiPolygon::new(vec![band_poly])),
+            gradient_meta: Some(GradientFillMeta::Radial {
+                center,
+                band_width: 0.12,
+                fade_in_r: None,
+                fade_out_r: None,
+            }),
+        };
+
+        let cfg = PlannerConfig::default();
+        let (job, buf) = rasterize_job_to_canvas(&[prim_band], &cfg, 512, 307);
+        let strokes: Vec<&Vec<StrokeWaypoint>> = job
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                JobOp::PaintStroke { points_canvas_3d } => Some(points_canvas_3d),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !strokes.is_empty() && strokes.len() <= 6,
+            "expected compact concentric radial rings, got {} strokes",
+            strokes.len()
+        );
+        for wps in &strokes {
+            let active = &wps[1..wps.len() - 1];
+            let radii: Vec<f64> = active
+                .iter()
+                .map(|wp| DVec2::new(wp.pos.x as f64, wp.pos.y as f64).distance(center))
+                .collect();
+            let mean_r = radii.iter().sum::<f64>() / radii.len() as f64;
+            for r in radii {
+                assert!(
+                    (r - mean_r).abs() < 2e-3,
+                    "radial gradient stroke deviated from concentric circle: r={r:.4} vs mean={mean_r:.4}"
+                );
+            }
+            for wp in active {
+                assert!(wp.standoff >= 0.12 - 1e-6 && wp.standoff <= 0.25 + 1e-6);
+            }
+        }
+
+        for deg in (0..360).step_by(15) {
+            let rad = (deg as f32).to_radians();
+            let x = center.x as f32 + 0.16 * rad.cos();
+            let y = center.y as f32 + 0.16 * rad.sin();
+            let cov = sample_coverage(&buf, x, y, paint_srgb);
+            assert!(
+                cov > 0.85,
+                "radial gradient annulus gap at deg={deg}: coverage={cov:.3}"
+            );
+        }
     }
 }

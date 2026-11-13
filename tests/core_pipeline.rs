@@ -116,7 +116,7 @@ fn verify_svg_end_to_end(rel_path: &str, max_cans: usize) -> PipelineVerifyResul
 
         if let Some(s0) = prev_frame {
             if s0.spray_active && frame.spray_active {
-                let max_dof = (0..7)
+                let max_dof = (0..9)
                     .map(|dof| (frame.joints[dof] - s0.joints[dof]).abs())
                     .fold(0.0_f64, f64::max);
                 assert!(

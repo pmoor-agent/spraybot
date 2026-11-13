@@ -5,7 +5,7 @@ use nalgebra::{SMatrix, SVector};
 
 use crate::core::types::{LinkTransform, StudioConfig};
 
-/// Descriptor for a single joint in the 7-DOF serial chain.
+/// Descriptor for a single joint in the 9-DOF serial chain.
 #[derive(Debug, Clone, PartialEq)]
 pub struct JointSpec {
     pub name: String,
@@ -35,7 +35,7 @@ impl Default for IkMode {
     }
 }
 
-/// Data-driven 7-DOF serial kinematic chain (1 prismatic rail + 6 revolute arm joints).
+/// Data-driven 9-DOF serial kinematic chain (1 prismatic rail + 8 revolute arm joints).
 #[derive(Debug, Clone, PartialEq)]
 pub struct KinematicChain {
     pub joints: Vec<JointSpec>,
@@ -43,20 +43,22 @@ pub struct KinematicChain {
     pub tcp_offset: Vec3,
     pub nozzle_local_pos: Vec3,
     pub nozzle_local_dir: Vec3,
-    pub comfort_pose: [f64; 7],
+    pub comfort_pose: [f64; 9],
 }
 
 impl KinematicChain {
-    /// Builds the default 7-DOF SprayBot chain matching [`StudioConfig`].
+    /// Builds the default 9-DOF SprayBot chain matching [`StudioConfig`].
     ///
     /// Link index meanings for [`Self::fk_links`]:
     /// - `0`: `rail_x` carriage at `(q0, carriage_y, rail_z)`, identity rotation.
     /// - `1`: `base_yaw` rotating riser/turret centered at mid-riser height, rotated by `q1` around `+Y`.
-    /// - `2`: `shoulder_pitch` upper-arm root at `(q0, shoulder_pivot_y, rail_z)` (`+Y` extends `L2` to elbow).
-    /// - `3`: `elbow_pitch` forearm root (`-Z` extends `L3` to `wrist_1`).
-    /// - `4`: `wrist_1` housing (`-Z` extends `0.09m` to `wrist_2`).
-    /// - `5`: `wrist_2` clevis (`-Z` extends `0.025m` to `flange_roll`).
-    /// - `6`: `flange_roll` tool flange (`tcp_offset = (0, 0, -0.025)` reaches grasp center; total wrist-to-grasp `0.14m`).
+    /// - `2`: `shoulder_pitch` lower upper-arm root at `(q0, shoulder_pivot_y, rail_z)` (`+Y` extends `0.5*L2`).
+    /// - `3`: `upper_arm_roll` upper-arm roll joint around `+Y` (`+Y` extends `0.5*L2` to elbow).
+    /// - `4`: `elbow_pitch` forearm root (`-Z` extends `L3` to `wrist_1`).
+    /// - `5`: `wrist_1` roll housing (`-Z` extends `0.065m` to `wrist_2`).
+    /// - `6`: `wrist_2` pitch clevis (`-Z` extends `0.030m` to `wrist_yaw`).
+    /// - `7`: `wrist_yaw` yaw clevis (`-Z` extends `0.020m` to `flange_roll`).
+    /// - `8`: `flange_roll` tool flange (`tcp_offset = (0, 0, -0.025)` reaches grasp center; total wrist-to-grasp `0.14m`).
     pub fn default_spraybot(studio: &StudioConfig) -> Self {
         let shoulder_dy = studio.shoulder_pivot_y - studio.carriage_y;
         Self {
@@ -92,13 +94,24 @@ impl KinematicChain {
                     max: 2.4,
                     max_vel: 2.2,
                     max_accel: 6.0,
-                    ik_weight: 1.5,
+                    ik_weight: 1.6,
+                },
+                JointSpec {
+                    name: "upper_arm_roll".to_string(),
+                    is_prismatic: false,
+                    axis: Vec3::Y,
+                    offset: Vec3::new(0.0, studio.upper_arm_l2 * 0.5, 0.0),
+                    min: -PI,
+                    max: PI,
+                    max_vel: 2.8,
+                    max_accel: 8.0,
+                    ik_weight: 1.1,
                 },
                 JointSpec {
                     name: "elbow_pitch".to_string(),
                     is_prismatic: false,
                     axis: Vec3::X,
-                    offset: Vec3::new(0.0, studio.upper_arm_l2, 0.0),
+                    offset: Vec3::new(0.0, studio.upper_arm_l2 * 0.5, 0.0),
                     min: -2.6,
                     max: 2.6,
                     max_vel: 2.6,
@@ -114,65 +127,76 @@ impl KinematicChain {
                     max: PI,
                     max_vel: 3.6,
                     max_accel: 10.0,
-                    ik_weight: 0.4,
+                    ik_weight: 0.45,
                 },
                 JointSpec {
                     name: "wrist_2".to_string(),
                     is_prismatic: false,
                     axis: Vec3::X,
-                    offset: Vec3::new(0.0, 0.0, -0.09),
+                    offset: Vec3::new(0.0, 0.0, -0.065),
                     min: -2.3,
                     max: 2.3,
                     max_vel: 3.6,
                     max_accel: 10.0,
-                    ik_weight: 0.4,
+                    ik_weight: 0.35,
+                },
+                JointSpec {
+                    name: "wrist_yaw".to_string(),
+                    is_prismatic: false,
+                    axis: Vec3::Y,
+                    offset: Vec3::new(0.0, 0.0, -0.030),
+                    min: -2.0,
+                    max: 2.0,
+                    max_vel: 3.8,
+                    max_accel: 10.0,
+                    ik_weight: 0.35,
                 },
                 JointSpec {
                     name: "flange_roll".to_string(),
                     is_prismatic: false,
                     axis: Vec3::Z,
-                    offset: Vec3::new(0.0, 0.0, -0.025),
+                    offset: Vec3::new(0.0, 0.0, -0.020),
                     min: -2.0 * PI,
                     max: 2.0 * PI,
-                    max_vel: 3.6,
+                    max_vel: 3.8,
                     max_accel: 10.0,
-                    ik_weight: 0.4,
+                    ik_weight: 0.40,
                 },
             ],
             base_origin: Vec3::new(0.0, studio.carriage_y, studio.rail_z),
             tcp_offset: Vec3::new(0.0, 0.0, -0.025),
             nozzle_local_pos: Vec3::new(0.0, 0.085, -0.015),
             nozzle_local_dir: Vec3::NEG_Z,
-            comfort_pose: [0.0, 0.0, -0.45, 1.05, 0.0, -0.60, 0.0],
+            comfort_pose: [0.0, 0.0, -0.45, 0.0, 1.05, 0.0, -0.60, 0.0, 0.0],
         }
     }
 
     /// Clamps a joint vector strictly within `[joint.min, joint.max]`.
-    pub fn clamp_joints(&self, q: &[f64; 7]) -> [f64; 7] {
+    pub fn clamp_joints(&self, q: &[f64; 9]) -> [f64; 9] {
         let mut out = *q;
-        for (i, j) in self.joints.iter().enumerate().take(7) {
+        for (i, j) in self.joints.iter().enumerate().take(9) {
             out[i] = out[i].clamp(j.min, j.max);
         }
         out
     }
 
     /// Returns `true` if every joint lies within `[min - tol, max + tol]`.
-    pub fn within_limits(&self, q: &[f64; 7], tol: f64) -> bool {
+    pub fn within_limits(&self, q: &[f64; 9], tol: f64) -> bool {
         self.joints
             .iter()
             .enumerate()
-            .take(7)
+            .take(9)
             .all(|(i, j)| q[i] >= j.min - tol && q[i] <= j.max + tol)
     }
 
     /// Internal f64 forward kinematics returning per-joint `(pos, rot, world_axis)` plus
     /// the grasp frame `(grasp_pos, grasp_rot)`.
-    fn fk_internal(&self, q: &[f64; 7]) -> ([(DVec3, DQuat, DVec3); 7], DVec3, DQuat) {
+    fn fk_internal(&self, q: &[f64; 9]) -> ([(DVec3, DQuat, DVec3); 9], DVec3, DQuat) {
         let mut p = self.base_origin.as_dvec3();
         let mut r = DQuat::IDENTITY;
-        let mut frames = [(DVec3::ZERO, DQuat::IDENTITY, DVec3::X); 7];
+        let mut frames = [(DVec3::ZERO, DQuat::IDENTITY, DVec3::X); 9];
 
-        for i in 0..7 {
+        for i in 0..9 {
             let j = &self.joints[i];
             p += r * j.offset.as_dvec3();
             let axis_local = j.axis.as_dvec3().normalize();
@@ -190,17 +214,19 @@ impl KinematicChain {
         (frames, grasp_pos, grasp_rot)
     }
 
-    /// Computes world-space transforms for all 7 moving links.
+    /// Computes world-space transforms for all 9 moving links.
     ///
     /// Index mapping:
     /// - `0`: `rail_x` carriage
     /// - `1`: `base_yaw` rotating riser
-    /// - `2`: `shoulder_pitch` upper arm
-    /// - `3`: `elbow_pitch` forearm
-    /// - `4`: `wrist_1` roll housing
-    /// - `5`: `wrist_2` pitch clevis
-    /// - `6`: `flange_roll` tool flange
-    pub fn fk_links(&self, q: &[f64; 7]) -> Vec<LinkTransform> {
+    /// - `2`: `shoulder_pitch` lower upper arm
+    /// - `3`: `upper_arm_roll` upper-arm roll joint
+    /// - `4`: `elbow_pitch` forearm
+    /// - `5`: `wrist_1` roll housing
+    /// - `6`: `wrist_2` pitch clevis
+    /// - `7`: `wrist_yaw` yaw clevis
+    /// - `8`: `flange_roll` tool flange
+    pub fn fk_links(&self, q: &[f64; 9]) -> Vec<LinkTransform> {
         let (frames, _, _) = self.fk_internal(q);
         frames
             .iter()
@@ -213,12 +239,12 @@ impl KinematicChain {
 
     /// Alias for [`Self::fk_links`] matching the initial Phase 1 stub name.
     #[inline]
-    pub fn fk_all_links(&self, q: &[f64; 7]) -> Vec<LinkTransform> {
+    pub fn fk_all_links(&self, q: &[f64; 9]) -> Vec<LinkTransform> {
         self.fk_links(q)
     }
 
     /// Computes world-space transform of the gripper grasp center.
-    pub fn fk_grasp(&self, q: &[f64; 7]) -> LinkTransform {
+    pub fn fk_grasp(&self, q: &[f64; 9]) -> LinkTransform {
         let (_, grasp_pos, grasp_rot) = self.fk_internal(q);
         LinkTransform {
             pos: grasp_pos.as_vec3(),
@@ -227,7 +253,7 @@ impl KinematicChain {
     }
 
     /// Computes `(nozzle_world_pos, spray_world_dir, can_up_world)` at joint configuration `q`.
-    pub fn fk_nozzle(&self, q: &[f64; 7]) -> (Vec3, Vec3, Vec3) {
+    pub fn fk_nozzle(&self, q: &[f64; 9]) -> (Vec3, Vec3, Vec3) {
         let (_, grasp_pos, grasp_rot) = self.fk_internal(q);
         let nozzle_pos = grasp_pos + grasp_rot * self.nozzle_local_pos.as_dvec3();
         let spray_dir = (grasp_rot * self.nozzle_local_dir.as_dvec3()).normalize();
@@ -239,10 +265,10 @@ impl KinematicChain {
         )
     }
 
-    /// Analytical 6x7 geometric Jacobian for a point `p_ee` rigidly attached to the tool flange.
-    fn jacobian_for_point(&self, frames: &[(DVec3, DQuat, DVec3); 7], p_ee: DVec3) -> SMatrix<f64, 6, 7> {
-        let mut jac = SMatrix::<f64, 6, 7>::zeros();
-        for i in 0..7 {
+    /// Analytical 6x9 geometric Jacobian for a point `p_ee` rigidly attached to the tool flange.
+    fn jacobian_for_point(&self, frames: &[(DVec3, DQuat, DVec3); 9], p_ee: DVec3) -> SMatrix<f64, 6, 9> {
+        let mut jac = SMatrix::<f64, 6, 9>::zeros();
+        for i in 0..9 {
             let (p_i, _, a_i) = frames[i];
             if self.joints[i].is_prismatic {
                 jac[(0, i)] = a_i.x;
@@ -261,34 +287,39 @@ impl KinematicChain {
         jac
     }
 
-    /// Analytical 6x7 geometric Jacobian for the nozzle TCP (`[linear; angular]`).
-    pub fn jacobian_nozzle(&self, q: &[f64; 7]) -> SMatrix<f64, 6, 7> {
+    /// Analytical 6x9 geometric Jacobian for the nozzle TCP (`[linear; angular]`).
+    pub fn jacobian_nozzle(&self, q: &[f64; 9]) -> SMatrix<f64, 6, 9> {
         let (frames, grasp_pos, grasp_rot) = self.fk_internal(q);
         let p_nozzle = grasp_pos + grasp_rot * self.nozzle_local_pos.as_dvec3();
         self.jacobian_for_point(&frames, p_nozzle)
     }
 
-    /// Analytical 6x7 geometric Jacobian for the gripper grasp center (`[linear; angular]`).
-    pub fn jacobian_grasp(&self, q: &[f64; 7]) -> SMatrix<f64, 6, 7> {
+    /// Analytical 6x9 geometric Jacobian for the gripper grasp center (`[linear; angular]`).
+    pub fn jacobian_grasp(&self, q: &[f64; 9]) -> SMatrix<f64, 6, 9> {
         let (frames, grasp_pos, _) = self.fk_internal(q);
         self.jacobian_for_point(&frames, grasp_pos)
     }
 
     /// Computes an analytical elbow-up seed for reaching a desired grasp frame `(grasp_pos, grasp_dir)`.
-    pub fn smart_seed_for_grasp(&self, grasp_pos: Vec3, grasp_dir: Vec3) -> [f64; 7] {
-        let l2 = self.joints[3].offset.y as f64;
-        let l3 = -self.joints[4].offset.z as f64;
-        let d_wrist_j5 = -self.joints[5].offset.z as f64;
-        let d_j5_grasp = -(self.joints[6].offset.z + self.tcp_offset.z) as f64;
-        let l3_eff = l3 + d_wrist_j5;
+    pub fn smart_seed_for_grasp(&self, grasp_pos: Vec3, grasp_dir: Vec3) -> [f64; 9] {
+        let l2 = (self.joints[3].offset.y + self.joints[4].offset.y) as f64;
+        let l3 = -self.joints[5].offset.z as f64;
+        let d_wrist_j6 = -self.joints[6].offset.z as f64;
+        let d_j6_grasp =
+            -(self.joints[7].offset.z + self.joints[8].offset.z + self.tcp_offset.z) as f64;
+        let l3_eff = l3 + d_wrist_j6;
 
         let g_pos = grasp_pos.as_dvec3();
         let g_dir = grasp_dir.as_dvec3().normalize();
-        // Estimate wrist_2 (J5) center back along -grasp_dir from grasp center
-        let p_w = g_pos - g_dir * d_j5_grasp;
+        // Estimate wrist_2 (J6) center back along -grasp_dir from grasp center
+        let p_w = g_pos - g_dir * d_j6_grasp;
 
         let q0 = p_w.x.clamp(self.joints[0].min, self.joints[0].max);
-        let shoulder = DVec3::new(q0, (self.base_origin.y + self.joints[1].offset.y + self.joints[2].offset.y) as f64, self.base_origin.z as f64);
+        let shoulder = DVec3::new(
+            q0,
+            (self.base_origin.y + self.joints[1].offset.y + self.joints[2].offset.y) as f64,
+            self.base_origin.z as f64,
+        );
 
         let dx = p_w.x - shoulder.x;
         let dy = p_w.y - shoulder.y;
@@ -305,24 +336,37 @@ impl KinematicChain {
         let max_r = l2 + l3_eff - 1e-4;
         let r_sq = (r_xz * r_xz + dy * dy).clamp(min_r * min_r, max_r * max_r);
 
-        let sin_q3 = ((r_sq - l2 * l2 - l3_eff * l3_eff) / (2.0 * l2 * l3_eff)).clamp(-1.0, 1.0);
-        // Elbow-up branch: q3 in [-pi/2, +pi/2]
-        let q3 = sin_q3.asin().clamp(self.joints[3].min, self.joints[3].max);
+        let sin_q4 = ((r_sq - l2 * l2 - l3_eff * l3_eff) / (2.0 * l2 * l3_eff)).clamp(-1.0, 1.0);
+        // Elbow-up branch: q4 in [-pi/2, +pi/2]
+        let q4 = sin_q4.asin().clamp(self.joints[4].min, self.joints[4].max);
 
-        let a = l2 + l3_eff * q3.sin();
-        let b = l3_eff * q3.cos();
+        let a = l2 + l3_eff * q4.sin();
+        let b = l3_eff * q4.cos();
         let q2 = (b * dy - a * r_xz)
             .atan2(a * dy + b * r_xz)
             .clamp(self.joints[2].min, self.joints[2].max);
 
         let target_pitch = g_dir.y.clamp(-1.0, 1.0).asin();
-        let q5 = (-(q2 + q3) + target_pitch).clamp(self.joints[5].min, self.joints[5].max);
+        let q6 = (-(q2 + q4) + target_pitch).clamp(self.joints[6].min, self.joints[6].max);
 
-        self.clamp_joints(&[q0, q1, q2, q3, 0.0, q5, 0.0])
+        // Horizontal yaw angle between Ry(q1)'s -Z and g_dir
+        let (sin_q1, cos_q1) = q1.sin_cos();
+        let fwd_base = DVec3::new(-sin_q1, 0.0, -cos_q1);
+        let right_base = DVec3::new(cos_q1, 0.0, -sin_q1);
+        let g_horiz = DVec3::new(g_dir.x, 0.0, g_dir.z);
+        let q7 = if g_horiz.length_squared() > 1e-8 {
+            (-g_horiz.dot(right_base))
+                .atan2(g_horiz.dot(fwd_base))
+                .clamp(self.joints[7].min, self.joints[7].max)
+        } else {
+            0.0
+        };
+
+        self.clamp_joints(&[q0, q1, q2, 0.0, q4, 0.0, q6, q7, 0.0])
     }
 
     /// Computes an analytical elbow-up seed for reaching a desired nozzle target `(nozzle_pos, spray_dir)`.
-    pub fn smart_seed_for_nozzle(&self, target_pos: Vec3, target_dir: Vec3) -> [f64; 7] {
+    pub fn smart_seed_for_nozzle(&self, target_pos: Vec3, target_dir: Vec3) -> [f64; 9] {
         let dir = target_dir.as_dvec3().normalize();
         // Construct upright grasp rotation whose -Z aligns with target_dir
         let rot = upright_rot_from_neg_z(dir, DVec3::Y);
@@ -333,7 +377,7 @@ impl KinematicChain {
     /// Core Weighted Damped Least-Squares iteration loop for nozzle or grasp targets.
     fn solve_dls_internal(
         &self,
-        q_seed: &[f64; 7],
+        q_seed: &[f64; 9],
         target_pos: DVec3,
         target_dir: DVec3,
         target_up: DVec3,
@@ -341,19 +385,19 @@ impl KinematicChain {
         use_nozzle_tcp: bool,
         mode: IkMode,
         max_iters: usize,
-    ) -> ([f64; 7], f64, f64) {
+    ) -> ([f64; 9], f64, f64) {
         let mut q = self.clamp_joints(q_seed);
         let d_t = target_dir.normalize();
 
         // Diagonal joint weights W and inverse W^{-1}
-        let mut w_inv = SMatrix::<f64, 7, 7>::zeros();
-        for i in 0..7 {
+        let mut w_inv = SMatrix::<f64, 9, 9>::zeros();
+        for i in 0..9 {
             let w = self.joints[i].ik_weight.max(1e-6);
             w_inv[(i, i)] = 1.0 / w;
         }
 
         let lambda = 0.025;
-        let alpha_null = 0.12;
+        let alpha_null = 0.06;
 
         for _ in 0..max_iters {
             let (frames, grasp_pos, grasp_rot) = self.fk_internal(&q);
@@ -450,7 +494,7 @@ impl KinematicChain {
             // Task-weighted Jacobian J_s = S * J and error e_s
             let mut j_s = jac;
             for r in 0..3 {
-                for c in 0..7 {
+                for c in 0..9 {
                     j_s[(3 + r, c)] = s_ang[(r, 0)] * jac[(3, c)]
                         + s_ang[(r, 1)] * jac[(4, c)]
                         + s_ang[(r, 2)] * jac[(5, c)];
@@ -474,20 +518,24 @@ impl KinematicChain {
                 // Null-space projector (I - J#_W * J_s)
                 let x_mat = chol.solve(&j_s);
                 let j_pinv_j = w_inv_jt * x_mat;
-                let null_proj = SMatrix::<f64, 7, 7>::identity() - j_pinv_j;
+                let null_proj = SMatrix::<f64, 9, 9>::identity() - j_pinv_j;
 
-                let mut v_null = SVector::<f64, 7>::zeros();
-                for i in 0..7 {
+                let mut v_null = SVector::<f64, 9>::zeros();
+                for i in 0..9 {
                     let j_spec = &self.joints[i];
                     let comfort_pull = if i == 0 {
                         let target_x = target_pos.x.clamp(j_spec.min, j_spec.max);
-                        0.24 * (target_x - q[0])
+                        0.28 * (target_x - q[0])
                     } else {
                         alpha_null * (self.comfort_pose[i] - q[i])
                     };
-                    // Soft joint-limit repulsion inside outer 12% of range
+                    // Soft joint-limit repulsion near endstops (tighter 4% margin on linear rail)
                     let span = (j_spec.max - j_spec.min).max(1e-6);
-                    let margin = 0.12 * span;
+                    let margin = if j_spec.is_prismatic {
+                        0.04 * span
+                    } else {
+                        0.12 * span
+                    };
                     let d_low = q[i] - j_spec.min;
                     let d_high = j_spec.max - q[i];
                     let mut repulse = 0.0;
@@ -499,16 +547,22 @@ impl KinematicChain {
                     }
                     v_null[i] = comfort_pull + repulse;
                 }
-                dq_t + null_proj * v_null
+                let mut dq_null = null_proj * v_null;
+                let max_null = dq_null.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+                if max_null > 0.04 {
+                    dq_null *= 0.04 / max_null;
+                }
+                let null_atten = (pos_err.max(rot_err * 0.15) / 0.002).clamp(0.0, 1.0);
+                dq_t + dq_null * null_atten
             } else {
-                SVector::<f64, 7>::zeros()
+                SVector::<f64, 9>::zeros()
             };
 
             // Step clamp for stability on large errors
             let max_step = dq_task.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
             let scale = if max_step > 0.35 { 0.35 / max_step } else { 1.0 };
 
-            for i in 0..7 {
+            for i in 0..9 {
                 q[i] += dq_task[i] * scale;
             }
             q = self.clamp_joints(&q);
@@ -548,30 +602,33 @@ impl KinematicChain {
     /// automatically retries from [`Self::smart_seed_for_nozzle`].
     pub fn solve_ik(
         &self,
-        q_seed: &[f64; 7],
+        q_seed: &[f64; 9],
         target_pos: Vec3,
         target_dir: Vec3,
         mode: IkMode,
-    ) -> Result<[f64; 7], String> {
+    ) -> Result<[f64; 9], String> {
         self.solve_ik_with_up(q_seed, target_pos, target_dir, Vec3::Y, mode)
     }
 
     /// Nozzle IK with explicit desired can-up vector (`target_up`, usually `Vec3::Y`).
     pub fn solve_ik_with_up(
         &self,
-        q_seed: &[f64; 7],
+        q_seed: &[f64; 9],
         target_pos: Vec3,
         target_dir: Vec3,
         target_up: Vec3,
         mode: IkMode,
-    ) -> Result<[f64; 7], String> {
+    ) -> Result<[f64; 9], String> {
         let p_t = target_pos.as_dvec3();
         let d_t = target_dir.as_dvec3().normalize();
         let u_t = target_up.as_dvec3().normalize();
 
+        let seed_noz_dist = (self.fk_nozzle(q_seed).0 - target_pos).length();
         let (q1, pos_err1, rot_err1) =
             self.solve_dls_internal(q_seed, p_t, d_t, u_t, None, true, mode, 16);
-        if pos_err1 <= 5e-4 && rot_err1 <= 0.2_f64.to_radians() {
+        let q1_clean = seed_noz_dist < 0.30
+            || ((q1[0] - target_pos.x as f64).abs() <= 0.25 && q1[7].abs() <= 0.45);
+        if q1_clean && pos_err1 <= 5e-4 && rot_err1 <= 0.2_f64.to_radians() {
             return Ok(q1);
         }
 
@@ -606,18 +663,18 @@ impl KinematicChain {
     /// `Ok((q2, true))` so callers can safely retract and reconfigure with the valve off.
     pub fn solve_ik_continuous(
         &self,
-        q_seed: &[f64; 7],
+        q_seed: &[f64; 9],
         target_pos: Vec3,
         target_dir: Vec3,
         mode: IkMode,
-    ) -> Result<([f64; 7], bool), String> {
+    ) -> Result<([f64; 9], bool), String> {
         let p_t = target_pos.as_dvec3();
         let d_t = target_dir.as_dvec3().normalize();
         let u_t = DVec3::Y;
 
         let (q1, pos_err1, rot_err1) =
             self.solve_dls_internal(q_seed, p_t, d_t, u_t, None, true, mode, 36);
-        let max_dq1 = (0..7)
+        let max_dq1 = (0..9)
             .map(|dof| (q1[dof] - q_seed[dof]).abs())
             .fold(0.0_f64, f64::max);
         if pos_err1 <= 1.0e-3 && rot_err1 <= 0.35_f64.to_radians() && max_dq1 <= 0.22 {
@@ -648,18 +705,20 @@ impl KinematicChain {
     /// Computes a conservative lower bound on world-space `Z` (meters) across all robot links,
     /// arm midpoints, gripper jaw corners, trigger servo top, and (when `held_can` is true)
     /// the aerosol can cylinder.
-    pub fn min_world_z(&self, q: &[f64; 7], held_can: bool) -> f32 {
-        const LINK_RADII: [f64; 7] = [0.16, 0.13, 0.08, 0.07, 0.05, 0.05, 0.05];
+    pub fn min_world_z(&self, q: &[f64; 9], held_can: bool) -> f32 {
+        const LINK_RADII: [f64; 9] = [0.16, 0.13, 0.08, 0.07, 0.07, 0.05, 0.05, 0.05, 0.05];
         let (frames, grasp_pos, grasp_rot) = self.fk_internal(q);
         let mut min_z = f64::INFINITY;
 
-        for i in 0..7 {
+        for i in 0..9 {
             min_z = min_z.min(frames[i].0.z - LINK_RADII[i]);
         }
 
-        let upper_mid = 0.5 * (frames[2].0 + frames[3].0);
-        let forearm_mid = 0.5 * (frames[3].0 + frames[4].0);
-        min_z = min_z.min(upper_mid.z - 0.07);
+        let upper_mid_a = 0.5 * (frames[2].0 + frames[3].0);
+        let upper_mid_b = 0.5 * (frames[3].0 + frames[4].0);
+        let forearm_mid = 0.5 * (frames[4].0 + frames[5].0);
+        min_z = min_z.min(upper_mid_a.z - 0.07);
+        min_z = min_z.min(upper_mid_b.z - 0.07);
         min_z = min_z.min(forearm_mid.z - 0.07);
 
         for sx in [-1.0_f64, 1.0_f64] {
@@ -686,10 +745,10 @@ impl KinematicChain {
     /// Weighted Damped Least-Squares 6-DOF IK solver targeting the gripper grasp frame `(target_pos, target_rot)`.
     pub fn solve_ik_grasp(
         &self,
-        q_seed: &[f64; 7],
+        q_seed: &[f64; 9],
         target_pos: Vec3,
         target_rot: Quat,
-    ) -> Result<[f64; 7], String> {
+    ) -> Result<[f64; 9], String> {
         let p_t = target_pos.as_dvec3();
         let q_t = target_rot.as_dquat().normalize();
         let d_t = (q_t * self.nozzle_local_dir.as_dvec3()).normalize();
@@ -763,22 +822,22 @@ mod tests {
         let studio = StudioConfig::default();
         let chain = KinematicChain::default_spraybot(&studio);
 
-        let poses: [[f64; 7]; 5] = [
+        let poses: [[f64; 9]; 5] = [
             chain.comfort_pose,
-            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            [-0.85, 0.35, -0.60, 0.85, 0.25, -0.45, 0.50],
-            [0.95, -0.40, -0.20, 1.30, -0.50, 0.35, -0.80],
-            [-1.50, 0.42, -0.75, -0.35, 0.40, 0.55, 0.20],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [-0.85, 0.35, -0.60, 0.30, 0.85, 0.25, -0.45, -0.22, 0.50],
+            [0.95, -0.40, -0.20, -0.35, 1.30, -0.50, 0.35, 0.28, -0.80],
+            [-1.50, 0.42, -0.75, 0.18, -0.35, 0.40, 0.55, -0.15, 0.20],
         ];
 
         let eps = 1e-6;
         for (idx, q) in poses.iter().enumerate() {
             let j_ana = chain.jacobian_nozzle(q);
-            let mut j_num = SMatrix::<f64, 6, 7>::zeros();
+            let mut j_num = SMatrix::<f64, 6, 9>::zeros();
 
             let (_, _, r0) = chain.fk_internal(q);
 
-            for col in 0..7 {
+            for col in 0..9 {
                 let mut qp = *q;
                 let mut qm = *q;
                 qp[col] += eps;
@@ -958,7 +1017,7 @@ mod tests {
                 !reconfigured,
                 "Unexpected reconfiguration at scanline step {k} x={x:.3}"
             );
-            let max_dq = (0..7)
+            let max_dq = (0..9)
                 .map(|dof| (q_k[dof] - q_prev[dof]).abs())
                 .fold(0.0_f64, f64::max);
             assert!(
@@ -975,10 +1034,91 @@ mod tests {
     }
 
     #[test]
+    fn oblique_scanline_drag_tilt_continuous_ik_and_wrist_smoothness() {
+        let studio = StudioConfig::default();
+        let chain = KinematicChain::default_spraybot(&studio);
+
+        let x_start = -1.17_f32;
+        let x_end = 1.17_f32;
+        let y = 1.55_f32;
+        let standoff = 0.14_f32;
+        let steps = (((x_end - x_start) / 0.005).round() as usize).max(1);
+
+        // Test both +15 deg (rightward drag) and -15 deg (leftward drag) yaw tilt
+        for yaw_deg in [15.0_f32, -15.0_f32] {
+            let yaw = yaw_deg.to_radians();
+            let target_dir = Vec3::new(yaw.sin(), 0.0, -yaw.cos()).normalize();
+            let (xs, xe) = if yaw_deg > 0.0 {
+                (x_start, x_end)
+            } else {
+                (x_end, x_start)
+            };
+
+            let canvas_pt_0 = Vec3::new(xs, y, 0.0);
+            let noz_0 = canvas_pt_0 - target_dir * standoff;
+            let seed_0 = chain.smart_seed_for_nozzle(noz_0, target_dir);
+            let mut q_prev = chain
+                .solve_ik(&seed_0, noz_0, target_dir, IkMode::Spray { roll_weight: 0.15 })
+                .unwrap_or_else(|e| panic!("Initial oblique IK (yaw={yaw_deg}deg) failed: {e}"));
+
+            let mut max_wrist_dq = 0.0_f64;
+            for k in 1..=steps {
+                let u = k as f32 / steps as f32;
+                let x = xs + (xe - xs) * u;
+                let canvas_pt = Vec3::new(x, y, 0.0);
+                let target_noz = canvas_pt - target_dir * standoff;
+
+                let (q_k, reconfigured) = chain
+                    .solve_ik_continuous(
+                        &q_prev,
+                        target_noz,
+                        target_dir,
+                        IkMode::Spray { roll_weight: 0.15 },
+                    )
+                    .unwrap_or_else(|e| {
+                        panic!("Oblique scanline (yaw={yaw_deg}deg) step {k} x={x:.3} failed: {e}")
+                    });
+
+                assert!(
+                    !reconfigured,
+                    "Unexpected reconfiguration on oblique scanline (yaw={yaw_deg}deg) step {k} x={x:.3}"
+                );
+                let max_dq = (0..9)
+                    .map(|dof| (q_k[dof] - q_prev[dof]).abs())
+                    .fold(0.0_f64, f64::max);
+                assert!(
+                    max_dq < 0.05,
+                    "Oblique joint step too large (yaw={yaw_deg}deg) at step {k} x={x:.3}: max_dq={max_dq:.5}"
+                );
+                for wrist_dof in 5..9 {
+                    max_wrist_dq = max_wrist_dq.max((q_k[wrist_dof] - q_prev[wrist_dof]).abs());
+                }
+
+                let (noz_fk, dir_fk, _) = chain.fk_nozzle(&q_k);
+                let pos_err = (noz_fk - target_noz).length();
+                let dir_err_deg = dir_fk.normalize().dot(target_dir).clamp(-1.0, 1.0).acos().to_degrees();
+                assert!(pos_err < 0.001, "pos_err={pos_err:.5}m at x={x:.3}");
+                assert!(dir_err_deg < 0.35, "dir_err={dir_err_deg:.3}deg at x={x:.3}");
+                assert!(
+                    chain.min_world_z(&q_k, true) > 0.012,
+                    "Canvas clearance violated on oblique scanline at x={x:.3}: min_z={:.4}",
+                    chain.min_world_z(&q_k, true)
+                );
+
+                q_prev = q_k;
+            }
+            assert!(
+                max_wrist_dq < 0.03,
+                "Wrist delta too large on oblique scanline (yaw={yaw_deg}deg): max_wrist_dq={max_wrist_dq:.5}"
+            );
+        }
+    }
+
+    #[test]
     fn min_world_z_park_home_is_high_clearance() {
         let studio = StudioConfig::default();
         let chain = KinematicChain::default_spraybot(&studio);
-        let park = [1.38, -0.25, 0.15, 1.10, 0.0, -1.25, 0.0];
+        let park = [1.38, -0.25, 0.15, 0.0, 1.10, 0.0, -1.25, 0.0, 0.0];
         let min_z = chain.min_world_z(&park, false);
         assert!(
             min_z >= 0.70,

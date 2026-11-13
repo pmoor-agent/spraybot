@@ -808,6 +808,7 @@ fn emit_polyline_stroke(
     let make_wp = |p: DVec2, opacity_scale: f32, valve_on: bool| StrokeWaypoint {
         pos: Vec3::new(p.x as f32, p.y as f32, 0.0),
         normal: Vec3::Z,
+        aim_dir: Vec3::NEG_Z,
         standoff,
         feed_speed,
         valve_on,

@@ -24,7 +24,7 @@ const SHAKE_FREQ_HZ: f64 = 6.0;
 /// Shake oscillation amplitude in radians (`±22°`).
 const SHAKE_AMP_RAD: f64 = 22.0_f64 * PI / 180.0;
 /// Unobstructed side park pose at the right end of the rail (`q0 = 1.38m > +1.25m` canvas edge).
-const PARK_HOME_JOINTS: [f64; 7] = [1.38, -0.25, 0.15, 1.10, 0.0, -1.25, 0.0];
+const PARK_HOME_JOINTS: [f64; 9] = [1.38, -0.25, 0.15, 0.0, 1.10, 0.0, -1.25, 0.0, 0.0];
 
 /// Symmetric smooth-ramp (`C²` continuous) S-curve 1D time-scaling profile on `[0, duration]`.
 #[derive(Debug, Clone, Copy)]
@@ -107,7 +107,7 @@ impl SCurveProfile {
 struct PathSample {
     s: f64,
     t: f64,
-    joints: [f64; 7],
+    joints: [f64; 9],
     valve_on: bool,
     opacity_scale: f32,
     cap: NozzleCap,
@@ -116,15 +116,15 @@ struct PathSample {
 #[derive(Debug, Clone)]
 enum SegmentKind {
     JointMove {
-        q_start: [f64; 7],
-        q_end: [f64; 7],
+        q_start: [f64; 9],
+        q_end: [f64; 9],
         profile: SCurveProfile,
         gripper_open: f32,
         held_can_slot: Option<usize>,
         active_cap: NozzleCap,
     },
     GripperActuate {
-        q: [f64; 7],
+        q: [f64; 9],
         open_start: f32,
         open_end: f32,
         slot_before: Option<usize>,
@@ -134,14 +134,14 @@ enum SegmentKind {
         switch_at: f32,
     },
     CapSwitchHold {
-        q: [f64; 7],
+        q: [f64; 9],
         held_can_slot: Option<usize>,
         cap_before: NozzleCap,
         cap_after: NozzleCap,
         switch_at: f32,
     },
     ShakeMove {
-        q_base: [f64; 7],
+        q_base: [f64; 9],
         pitch_bounds: (f64, f64),
         roll_bounds: (f64, f64),
         held_can_slot: Option<usize>,
@@ -172,7 +172,7 @@ struct TimelineSegment {
 #[derive(Debug, Clone)]
 pub struct CompiledTimeline {
     pub total_duration: f64,
-    pub home_joints: [f64; 7],
+    pub home_joints: [f64; 9],
     chain: KinematicChain,
     segments: Vec<TimelineSegment>,
 }
@@ -193,7 +193,7 @@ impl CompiledTimeline {
 
     /// Returns the robot's home joint configuration.
     #[inline]
-    pub fn home_joints(&self) -> [f64; 7] {
+    pub fn home_joints(&self) -> [f64; 9] {
         self.home_joints
     }
 
@@ -342,8 +342,8 @@ impl CompiledTimeline {
                         t_end,
                         kind: SegmentKind::ShakeMove {
                             q_base: q_curr,
-                            pitch_bounds: (chain.joints[5].min, chain.joints[5].max),
-                            roll_bounds: (chain.joints[4].min, chain.joints[4].max),
+                            pitch_bounds: (chain.joints[6].min, chain.joints[6].max),
+                            roll_bounds: (chain.joints[5].min, chain.joints[5].max),
                             held_can_slot,
                             active_cap,
                         },
@@ -819,6 +819,7 @@ impl CompiledTimeline {
                 nozzle_world_pos,
                 nozzle_world_dir,
                 spray_active: false,
+                is_shaking: false,
                 flow_scale: 0.0,
                 active_cap: NozzleCap::Fat,
             };
@@ -839,6 +840,7 @@ impl CompiledTimeline {
             trigger_depressed,
             held_can_slot,
             spray_active,
+            is_shaking,
             flow_scale,
             active_cap,
         ) = match &seg.kind {
@@ -851,11 +853,11 @@ impl CompiledTimeline {
                 active_cap,
             } => {
                 let s = profile.eval(t_local);
-                let mut q = [0.0; 7];
-                for i in 0..7 {
+                let mut q = [0.0; 9];
+                for i in 0..9 {
                     q[i] = q_start[i] + (q_end[i] - q_start[i]) * s;
                 }
-                (q, *gripper_open, 0.0, *held_can_slot, false, 0.0, *active_cap)
+                (q, *gripper_open, 0.0, *held_can_slot, false, false, 0.0, *active_cap)
             }
 
             SegmentKind::GripperActuate {
@@ -875,7 +877,7 @@ impl CompiledTimeline {
                 } else {
                     (*slot_before, *cap_before)
                 };
-                (*q, g, 0.0, slot, false, 0.0, cap)
+                (*q, g, 0.0, slot, false, false, 0.0, cap)
             }
 
             SegmentKind::CapSwitchHold {
@@ -891,7 +893,7 @@ impl CompiledTimeline {
                 } else {
                     *cap_before
                 };
-                (*q, 0.0, 0.0, *held_can_slot, false, 0.0, cap)
+                (*q, 0.0, 0.0, *held_can_slot, false, false, 0.0, cap)
             }
 
             SegmentKind::ShakeMove {
@@ -912,11 +914,11 @@ impl CompiledTimeline {
                 };
                 let phase = 2.0 * PI * SHAKE_FREQ_HZ * t_local;
                 let mut q = *q_base;
-                q[5] = (q_base[5] + env * SHAKE_AMP_RAD * phase.sin())
+                q[6] = (q_base[6] + env * SHAKE_AMP_RAD * phase.sin())
                     .clamp(pitch_bounds.0, pitch_bounds.1);
-                q[4] = (q_base[4] + env * 0.85 * SHAKE_AMP_RAD * (phase + 0.35).sin())
+                q[5] = (q_base[5] + env * 0.85 * SHAKE_AMP_RAD * (phase + 0.35).sin())
                     .clamp(roll_bounds.0, roll_bounds.1);
-                (q, 0.0, 0.0, *held_can_slot, false, 0.0, *active_cap)
+                (q, 0.0, 0.0, *held_can_slot, false, true, 0.0, *active_cap)
             }
 
             SegmentKind::ArcScaledPath {
@@ -929,7 +931,7 @@ impl CompiledTimeline {
                 let total_s = samples.last().map(|s| s.s).unwrap_or(0.0);
                 let target_s = profile.eval(t_local) * total_s;
                 let (q, _, _, _) = interpolate_samples_by_s(samples, target_s);
-                (q, *gripper_open, 0.0, *held_can_slot, false, 0.0, *active_cap)
+                (q, *gripper_open, 0.0, *held_can_slot, false, false, 0.0, *active_cap)
             }
 
             SegmentKind::TimedStroke {
@@ -940,7 +942,7 @@ impl CompiledTimeline {
                 let (q, valve_on, opacity, cap) = interpolate_samples_by_t(samples, t_local);
                 let trig = if valve_on { 1.0 } else { 0.0 };
                 let flow = if valve_on { opacity } else { 0.0 };
-                (q, *gripper_open, trig, *held_can_slot, valve_on, flow, cap)
+                (q, *gripper_open, trig, *held_can_slot, valve_on, false, flow, cap)
             }
         };
 
@@ -953,6 +955,7 @@ impl CompiledTimeline {
             nozzle_world_pos,
             nozzle_world_dir,
             spray_active,
+            is_shaking,
             flow_scale,
             active_cap,
         }
@@ -962,16 +965,16 @@ impl CompiledTimeline {
 /// Evaluates minimum world Z clearance along a joint-space linear interpolation `q_a -> q_b`.
 fn min_joint_path_z(
     chain: &KinematicChain,
-    q_a: &[f64; 7],
-    q_b: &[f64; 7],
+    q_a: &[f64; 9],
+    q_b: &[f64; 9],
     held_can: bool,
     steps: usize,
 ) -> f32 {
     let mut min_z = f32::INFINITY;
     for k in 0..=steps {
         let u = k as f64 / steps as f64;
-        let mut q = [0.0; 7];
-        for i in 0..7 {
+        let mut q = [0.0; 9];
+        for i in 0..9 {
             q[i] = q_a[i] + (q_b[i] - q_a[i]) * u;
         }
         min_z = min_z.min(chain.min_world_z(&q, held_can));
@@ -984,8 +987,8 @@ fn push_raw_joint_move(
     chain: &KinematicChain,
     segments: &mut Vec<TimelineSegment>,
     t_cursor: &mut f64,
-    q_from: [f64; 7],
-    q_to: [f64; 7],
+    q_from: [f64; 9],
+    q_to: [f64; 9],
     g_open: f32,
     can_slot: Option<usize>,
     active_cap: NozzleCap,
@@ -1016,8 +1019,8 @@ fn push_checked_joint_move(
     chain: &KinematicChain,
     segments: &mut Vec<TimelineSegment>,
     t_cursor: &mut f64,
-    q_from: [f64; 7],
-    q_to: [f64; 7],
+    q_from: [f64; 9],
+    q_to: [f64; 9],
     g_open: f32,
     can_slot: Option<usize>,
     active_cap: NozzleCap,
@@ -1036,11 +1039,11 @@ fn push_checked_joint_move(
         return;
     }
 
-    // At q2 = +0.45 (shoulder pitched back), wrist Z >= 0.64m regardless of q3/q5.
+    // At q2 = +0.45 (shoulder pitched back), wrist Z >= 0.64m regardless of q4/q6.
     // Stage: (optional Cartesian +Z retract) -> q2 = 0.45 -> move other joints at q2 = 0.45 -> move q2 to q_to[2].
     let mut q_cur = q_from;
     let q_retract_a = chain.clamp_joints(&[
-        q_cur[0], q_cur[1], 0.45, q_cur[3], q_cur[4], q_cur[5], q_cur[6],
+        q_cur[0], q_cur[1], 0.45, q_cur[3], q_cur[4], q_cur[5], q_cur[6], q_cur[7], q_cur[8],
     ]);
     if min_joint_path_z(chain, &q_cur, &q_retract_a, held_can, 40) < end_floor {
         let (noz, dir, _) = chain.fk_nozzle(&q_cur);
@@ -1058,10 +1061,10 @@ fn push_checked_joint_move(
     }
 
     let q_back_from = chain.clamp_joints(&[
-        q_cur[0], q_cur[1], 0.45, q_cur[3], q_cur[4], q_cur[5], q_cur[6],
+        q_cur[0], q_cur[1], 0.45, q_cur[3], q_cur[4], q_cur[5], q_cur[6], q_cur[7], q_cur[8],
     ]);
     let q_back_to = chain.clamp_joints(&[
-        q_to[0], q_to[1], 0.45, q_to[3], q_to[4], q_to[5], q_to[6],
+        q_to[0], q_to[1], 0.45, q_to[3], q_to[4], q_to[5], q_to[6], q_to[7], q_to[8],
     ]);
     let z_1 = min_joint_path_z(chain, &q_cur, &q_back_from, held_can, 40);
     let z_2 = min_joint_path_z(chain, &q_back_from, &q_back_to, held_can, 40);
@@ -1080,8 +1083,12 @@ fn push_checked_joint_move(
     }
 
     // Fallback: tuck via PARK_HOME arm posture at q2 = 0.45
-    let q_park_from = chain.clamp_joints(&[q_cur[0], q_cur[1], 0.45, 1.10, 0.0, -1.25, 0.0]);
-    let q_park_to = chain.clamp_joints(&[q_to[0], q_to[1], 0.45, 1.10, 0.0, -1.25, 0.0]);
+    let q_park_from = chain.clamp_joints(&[
+        q_cur[0], q_cur[1], 0.45, 0.0, 1.10, 0.0, -1.25, 0.0, 0.0,
+    ]);
+    let q_park_to = chain.clamp_joints(&[
+        q_to[0], q_to[1], 0.45, 0.0, 1.10, 0.0, -1.25, 0.0, 0.0,
+    ]);
     let pz1 = min_joint_path_z(chain, &q_cur, &q_park_from, held_can, 40);
     let pz2 = min_joint_path_z(chain, &q_park_from, &q_park_to, held_can, 40);
     let pz3 = min_joint_path_z(chain, &q_park_to, &q_to, held_can, 40);
@@ -1110,8 +1117,8 @@ fn push_safe_joint_move(
     chain: &KinematicChain,
     segments: &mut Vec<TimelineSegment>,
     t_cursor: &mut f64,
-    q_from: [f64; 7],
-    q_to: [f64; 7],
+    q_from: [f64; 9],
+    q_to: [f64; 9],
     g_open: f32,
     can_slot: Option<usize>,
     active_cap: NozzleCap,
@@ -1124,8 +1131,8 @@ fn push_safe_joint_move(
         return;
     }
 
-    let tuck_arm = |q: &[f64; 7]| -> [f64; 7] {
-        chain.clamp_joints(&[q[0], q[1], 0.15, 1.10, q[4], -1.25, q[6]])
+    let tuck_arm = |q: &[f64; 9]| -> [f64; 9] {
+        chain.clamp_joints(&[q[0], q[1], 0.15, q[3], 1.10, q[5], -1.25, q[7], q[8]])
     };
 
     let mut q_cur = q_from;
@@ -1164,7 +1171,7 @@ fn push_safe_joint_move(
 
     // If destination is near the wall, stage through a high-Z pose above it and descend linearly in -Z.
     let (to_noz, to_dir, _) = chain.fk_nozzle(&q_to);
-    let mut descend_seg: Option<(TimelineSegment, [f64; 7])> = None;
+    let mut descend_seg: Option<(TimelineSegment, [f64; 9])> = None;
     let mut q_target = q_to;
     if to_dir.z < -0.5 && to_noz.z < 0.46 {
         let safe_z = 0.50_f32.max(to_noz.z + 0.14);
@@ -1212,9 +1219,11 @@ fn push_safe_joint_move(
             q_target[0],
             q_target[1].clamp(-1.35, 1.35),
             0.15,
+            0.0,
             1.10,
             0.0,
             -1.25,
+            0.0,
             0.0,
         ]);
         push_checked_joint_move(
@@ -1239,12 +1248,12 @@ fn push_safe_joint_move(
 }
 
 /// Computes synchronized joint-space S-curve profile strictly respecting all joint velocity & accel limits.
-fn joint_move_profile(chain: &KinematicChain, q_a: &[f64; 7], q_b: &[f64; 7]) -> SCurveProfile {
+fn joint_move_profile(chain: &KinematicChain, q_a: &[f64; 9], q_b: &[f64; 9]) -> SCurveProfile {
     let mut max_dq = 0.0_f64;
     let mut s_v_lim = f64::INFINITY;
     let mut s_a_lim = f64::INFINITY;
 
-    for i in 0..7 {
+    for i in 0..9 {
         let dq = (q_b[i] - q_a[i]).abs();
         if dq > 1e-8 {
             max_dq = max_dq.max(dq);
@@ -1276,7 +1285,7 @@ fn path_scurve_profile(
 
     for pair in samples.windows(2) {
         let ds = (pair[1].s - pair[0].s).max(1e-6);
-        for i in 0..7 {
+        for i in 0..9 {
             let dq = (pair[1].joints[i] - pair[0].joints[i]).abs();
             if dq > 1e-8 {
                 let ratio = dq / ds;
@@ -1292,7 +1301,7 @@ fn path_scurve_profile(
 #[allow(clippy::too_many_arguments)]
 fn build_cartesian_grasp_segment(
     chain: &KinematicChain,
-    q_start: [f64; 7],
+    q_start: [f64; 9],
     pos_start: Vec3,
     pos_end: Vec3,
     rot: glam::Quat,
@@ -1302,7 +1311,7 @@ fn build_cartesian_grasp_segment(
     held_can_slot: Option<usize>,
     active_cap: NozzleCap,
     t_start: f64,
-) -> Result<(TimelineSegment, [f64; 7]), String> {
+) -> Result<(TimelineSegment, [f64; 9]), String> {
     let dist = (pos_end - pos_start).length() as f64;
     let steps = ((dist / 0.008).ceil() as usize).clamp(4, 200);
 
@@ -1352,7 +1361,7 @@ fn build_cartesian_grasp_segment(
 #[allow(clippy::too_many_arguments)]
 fn build_cartesian_nozzle_segment(
     chain: &KinematicChain,
-    q_start: [f64; 7],
+    q_start: [f64; 9],
     pos_start: Vec3,
     pos_end: Vec3,
     dir_start: Vec3,
@@ -1363,7 +1372,7 @@ fn build_cartesian_nozzle_segment(
     held_can_slot: Option<usize>,
     active_cap: NozzleCap,
     t_start: f64,
-) -> Result<(TimelineSegment, [f64; 7]), String> {
+) -> Result<(TimelineSegment, [f64; 9]), String> {
     let dist = (pos_end - pos_start).length() as f64;
     let steps = ((dist / 0.004).ceil() as usize).clamp(4, 300);
 
@@ -1383,7 +1392,7 @@ fn build_cartesian_nozzle_segment(
         let d = dir_start.lerp(dir_end, u).normalize_or(Vec3::NEG_Z);
         let (q_k, reconfigured) =
             chain.solve_ik_continuous(&q_prev, p, d, IkMode::Spray { roll_weight: 0.15 })?;
-        let max_dq = (0..7)
+        let max_dq = (0..9)
             .map(|dof| (q_k[dof] - q_prev[dof]).abs())
             .fold(0.0_f64, f64::max);
         if reconfigured || max_dq > 0.25 {
@@ -1440,7 +1449,7 @@ fn finalize_timed_stroke(
     let mut seg_a_lim = vec![2.2_f64; n - 1];
     for j in 0..n - 1 {
         let ds = (samples[j + 1].s - samples[j].s).max(1e-6);
-        for dof in 0..7 {
+        for dof in 0..9 {
             let dq = (samples[j + 1].joints[dof] - samples[j].joints[dof]).abs();
             if dq > 1e-8 {
                 let ratio = dq / ds;
@@ -1503,13 +1512,13 @@ fn finalize_timed_stroke(
 
 fn build_timed_stroke_segments(
     chain: &KinematicChain,
-    q_start: [f64; 7],
+    q_start: [f64; 9],
     waypoints: &[StrokeWaypoint],
     gripper_open: f32,
     held_can_slot: Option<usize>,
     segments: &mut Vec<TimelineSegment>,
     t_cursor: &mut f64,
-) -> Result<[f64; 7], String> {
+) -> Result<[f64; 9], String> {
     let mut dense_pos: Vec<Vec3> = Vec::new();
     let mut samples: Vec<PathSample> = Vec::new();
     let mut target_speeds: Vec<f64> = Vec::new();
@@ -1567,7 +1576,7 @@ fn build_timed_stroke_segments(
 
             let (q_k, reconfigured) =
                 chain.solve_ik_continuous(&q_prev, p, d, IkMode::Spray { roll_weight: 0.15 })?;
-            let max_dq = (0..7)
+            let max_dq = (0..9)
                 .map(|dof| (q_k[dof] - q_prev[dof]).abs())
                 .fold(0.0_f64, f64::max);
 
@@ -1746,9 +1755,9 @@ fn build_timed_stroke_segments(
 fn interpolate_samples_by_s(
     samples: &[PathSample],
     target_s: f64,
-) -> ([f64; 7], bool, f32, NozzleCap) {
+) -> ([f64; 9], bool, f32, NozzleCap) {
     if samples.is_empty() {
-        return ([0.0; 7], false, 0.0, NozzleCap::Fat);
+        return ([0.0; 9], false, 0.0, NozzleCap::Fat);
     }
     if samples.len() == 1 || target_s <= samples[0].s {
         return (
@@ -1772,8 +1781,8 @@ fn interpolate_samples_by_s(
     } else {
         0.0
     };
-    let mut q = [0.0; 7];
-    for dof in 0..7 {
+    let mut q = [0.0; 9];
+    for dof in 0..9 {
         q[dof] = samples[i0].joints[dof] + (samples[i1].joints[dof] - samples[i0].joints[dof]) * u;
     }
     (q, samples[i1].valve_on, samples[i1].opacity_scale, samples[i1].cap)
@@ -1782,9 +1791,9 @@ fn interpolate_samples_by_s(
 fn interpolate_samples_by_t(
     samples: &[PathSample],
     t_local: f64,
-) -> ([f64; 7], bool, f32, NozzleCap) {
+) -> ([f64; 9], bool, f32, NozzleCap) {
     if samples.is_empty() {
-        return ([0.0; 7], false, 0.0, NozzleCap::Fat);
+        return ([0.0; 9], false, 0.0, NozzleCap::Fat);
     }
     if samples.len() == 1 || t_local <= samples[0].t {
         return (
@@ -1808,8 +1817,8 @@ fn interpolate_samples_by_t(
     } else {
         0.0
     };
-    let mut q = [0.0; 7];
-    for dof in 0..7 {
+    let mut q = [0.0; 9];
+    for dof in 0..9 {
         q[dof] = samples[i0].joints[dof] + (samples[i1].joints[dof] - samples[i0].joints[dof]) * u;
     }
     (q, samples[i1].valve_on, samples[i1].opacity_scale, samples[i1].cap)
@@ -1828,6 +1837,7 @@ mod tests {
             StrokeWaypoint {
                 pos: Vec3::new(-0.435, 1.55, 0.0),
                 normal: Vec3::Z,
+                aim_dir: Vec3::NEG_Z,
                 standoff: 0.10,
                 feed_speed: 0.40,
                 valve_on: false,
@@ -1837,6 +1847,7 @@ mod tests {
             StrokeWaypoint {
                 pos: Vec3::new(-0.40, 1.55, 0.0),
                 normal: Vec3::Z,
+                aim_dir: Vec3::NEG_Z,
                 standoff: 0.10,
                 feed_speed: 0.40,
                 valve_on: true,
@@ -1846,6 +1857,7 @@ mod tests {
             StrokeWaypoint {
                 pos: Vec3::new(0.40, 1.55, 0.0),
                 normal: Vec3::Z,
+                aim_dir: Vec3::NEG_Z,
                 standoff: 0.10,
                 feed_speed: 0.40,
                 valve_on: true,
@@ -1855,6 +1867,7 @@ mod tests {
             StrokeWaypoint {
                 pos: Vec3::new(0.435, 1.55, 0.0),
                 normal: Vec3::Z,
+                aim_dir: Vec3::NEG_Z,
                 standoff: 0.10,
                 feed_speed: 0.40,
                 valve_on: false,
@@ -1884,7 +1897,8 @@ mod tests {
         assert_eq!(s0.held_can_slot, None);
         assert!((s0.gripper_open - 1.0).abs() < 1e-4);
         assert!(!s0.spray_active);
-        for i in 0..7 {
+        assert!(!s0.is_shaking);
+        for i in 0..9 {
             assert!((s0.joints[i] - timeline.home_joints()[i]).abs() < 1e-6);
         }
 
@@ -1892,7 +1906,8 @@ mod tests {
         assert_eq!(s_end.held_can_slot, None);
         assert!((s_end.gripper_open - 1.0).abs() < 1e-4);
         assert!(!s_end.spray_active);
-        for i in 0..7 {
+        assert!(!s_end.is_shaking);
+        for i in 0..9 {
             assert!((s_end.joints[i] - timeline.home_joints()[i]).abs() < 1e-5);
         }
 
@@ -1902,6 +1917,7 @@ mod tests {
         let mut prev = timeline.sample(0.0);
         let mut saw_held_slot_2 = false;
         let mut saw_spray_on = false;
+        let mut saw_shaking = false;
         let mut saw_closed_gripper = false;
 
         for k in 1..=steps {
@@ -1915,9 +1931,9 @@ mod tests {
             );
 
             // C0 continuity: bounded step per dt
-            for i in 0..7 {
+            for i in 0..9 {
                 let dq = (cur.joints[i] - prev.joints[i]).abs();
-                let max_step = if i == 4 || i == 5 {
+                let max_step = if i == 5 || i == 6 {
                     // During 6 Hz ±22° shake, peak velocity ~ 14.5 rad/s
                     16.0 * dt
                 } else {
@@ -1935,8 +1951,13 @@ mod tests {
             if cur.gripper_open < 0.05 {
                 saw_closed_gripper = true;
             }
+            if cur.is_shaking {
+                saw_shaking = true;
+                assert!(!cur.spray_active, "Cannot spray while shaking");
+            }
             if cur.spray_active {
                 saw_spray_on = true;
+                assert!(!cur.is_shaking, "is_shaking must be false while spraying");
                 assert!((cur.trigger_depressed - 1.0).abs() < 1e-5);
                 assert_eq!(cur.held_can_slot, Some(2));
                 assert!((cur.nozzle_world_pos.z - 0.10).abs() < 0.002);
@@ -1950,6 +1971,7 @@ mod tests {
 
         assert!(saw_held_slot_2, "Never picked up can slot 2");
         assert!(saw_closed_gripper, "Gripper never closed");
+        assert!(saw_shaking, "is_shaking was never true during ShakeCan");
         assert!(saw_spray_on, "Spray never activated during PaintStroke");
     }
 
@@ -1979,6 +2001,7 @@ mod tests {
             StrokeWaypoint {
                 pos: Vec3::new(-1.17, 1.55, 0.0),
                 normal: Vec3::Z,
+                aim_dir: Vec3::NEG_Z,
                 standoff: 0.22,
                 feed_speed: 0.45,
                 valve_on: false,
@@ -1988,6 +2011,7 @@ mod tests {
             StrokeWaypoint {
                 pos: Vec3::new(-1.10, 1.55, 0.0),
                 normal: Vec3::Z,
+                aim_dir: Vec3::NEG_Z,
                 standoff: 0.22,
                 feed_speed: 0.45,
                 valve_on: true,
@@ -1997,6 +2021,7 @@ mod tests {
             StrokeWaypoint {
                 pos: Vec3::new(1.10, 1.55, 0.0),
                 normal: Vec3::Z,
+                aim_dir: Vec3::NEG_Z,
                 standoff: 0.22,
                 feed_speed: 0.45,
                 valve_on: true,
@@ -2006,6 +2031,7 @@ mod tests {
             StrokeWaypoint {
                 pos: Vec3::new(1.17, 1.55, 0.0),
                 normal: Vec3::Z,
+                aim_dir: Vec3::NEG_Z,
                 standoff: 0.22,
                 feed_speed: 0.45,
                 valve_on: false,
@@ -2018,6 +2044,7 @@ mod tests {
             StrokeWaypoint {
                 pos: Vec3::new(0.80, 1.85, 0.0),
                 normal: Vec3::Z,
+                aim_dir: Vec3::NEG_Z,
                 standoff: 0.10,
                 feed_speed: 0.35,
                 valve_on: false,
@@ -2027,6 +2054,7 @@ mod tests {
             StrokeWaypoint {
                 pos: Vec3::new(0.75, 1.85, 0.0),
                 normal: Vec3::Z,
+                aim_dir: Vec3::NEG_Z,
                 standoff: 0.10,
                 feed_speed: 0.35,
                 valve_on: true,
@@ -2036,6 +2064,7 @@ mod tests {
             StrokeWaypoint {
                 pos: Vec3::new(-0.75, 1.85, 0.0),
                 normal: Vec3::Z,
+                aim_dir: Vec3::NEG_Z,
                 standoff: 0.10,
                 feed_speed: 0.35,
                 valve_on: true,
@@ -2045,6 +2074,7 @@ mod tests {
             StrokeWaypoint {
                 pos: Vec3::new(-0.80, 1.85, 0.0),
                 normal: Vec3::Z,
+                aim_dir: Vec3::NEG_Z,
                 standoff: 0.10,
                 feed_speed: 0.35,
                 valve_on: false,

@@ -99,7 +99,9 @@ pub struct StrokeWaypoint {
     pub pos: Vec3,
     /// Unit outward surface normal from canvas (`+Z` for front wall).
     pub normal: Vec3,
-    /// Nozzle standoff distance from `pos` along `normal` (meters).
+    /// Desired unit spray aim direction (typically `Vec3::NEG_Z`, tilted for drag strokes).
+    pub aim_dir: Vec3,
+    /// Nozzle standoff distance from `pos` along `-spray_dir()` (meters).
     pub standoff: f32,
     /// Desired linear nozzle speed along the path (m/s).
     pub feed_speed: f32,
@@ -112,16 +114,17 @@ pub struct StrokeWaypoint {
 }
 
 impl StrokeWaypoint {
-    /// World-space 3D nozzle tip position (`pos + normal * standoff`).
+    /// World-space 3D nozzle tip position (`pos - spray_dir() * standoff`).
     #[inline]
     pub fn nozzle_pos(&self) -> Vec3 {
-        self.pos + self.normal * self.standoff
+        let dir = self.spray_dir();
+        self.pos - dir * self.standoff
     }
 
-    /// World-space spray plume direction (`-normal`).
+    /// World-space spray plume direction (`aim_dir.normalize_or(-normal)`).
     #[inline]
     pub fn spray_dir(&self) -> Vec3 {
-        -self.normal
+        self.aim_dir.normalize_or(-self.normal)
     }
 }
 
@@ -145,8 +148,8 @@ pub struct JobPlan {
 /// Continuous sampled robot and spray state at simulation time `t_sim`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RobotFrameState {
-    /// `joints[0]` = floor rail X (meters); `joints[1..7]` = 6 arm revolute angles (radians).
-    pub joints: [f64; 7],
+    /// `joints[0]` = floor rail X (meters); `joints[1..9]` = 8 arm revolute angles (radians).
+    pub joints: [f64; 9],
     /// Gripper jaw opening: `0.0` (closed on can) .. `1.0` (open).
     pub gripper_open: f32,
     /// Trigger finger depression: `0.0` (released) .. `1.0` (spraying).
@@ -159,6 +162,8 @@ pub struct RobotFrameState {
     pub nozzle_world_dir: Vec3,
     /// True while paint should actively deposit onto the canvas and emit mist.
     pub spray_active: bool,
+    /// True only while executing a `ShakeCan` segment.
+    pub is_shaking: bool,
     /// Instantaneous flow/opacity multiplier in `[0.0, 1.0]`.
     pub flow_scale: f32,
     /// Currently mounted nozzle cap profile.
@@ -168,13 +173,14 @@ pub struct RobotFrameState {
 impl Default for RobotFrameState {
     fn default() -> Self {
         Self {
-            joints: [0.0; 7],
+            joints: [0.0; 9],
             gripper_open: 1.0,
             trigger_depressed: 0.0,
             held_can_slot: None,
             nozzle_world_pos: Vec3::new(0.0, 1.35, 0.50),
             nozzle_world_dir: Vec3::NEG_Z,
             spray_active: false,
+            is_shaking: false,
             flow_scale: 0.0,
             active_cap: NozzleCap::Fat,
         }
@@ -417,6 +423,7 @@ mod tests {
         let wp = StrokeWaypoint {
             pos: Vec3::new(0.5, 1.5, 0.0),
             normal: Vec3::Z,
+            aim_dir: Vec3::NEG_Z,
             standoff: 0.12,
             feed_speed: 0.35,
             valve_on: true,
@@ -429,6 +436,44 @@ mod tests {
         assert_relative_eq!(wp.spray_dir().x, 0.0, epsilon = 1e-6);
         assert_relative_eq!(wp.spray_dir().y, 0.0, epsilon = 1e-6);
         assert_relative_eq!(wp.spray_dir().z, -1.0, epsilon = 1e-6);
+
+        // Zero aim_dir falls back cleanly to -normal
+        let fallback_wp = StrokeWaypoint {
+            aim_dir: Vec3::ZERO,
+            ..wp
+        };
+        assert_relative_eq!(fallback_wp.spray_dir().z, -1.0, epsilon = 1e-6);
+        assert_relative_eq!(fallback_wp.nozzle_pos().z, 0.12, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn stroke_waypoint_aim_dir_tilting_hits_canvas_pos() {
+        let yaw = 15.0_f32.to_radians();
+        let pitch = -8.0_f32.to_radians();
+        let aim = Vec3::new(yaw.sin(), pitch.sin(), -(yaw.cos() * pitch.cos()));
+        let wp = StrokeWaypoint {
+            pos: Vec3::new(-0.35, 1.42, 0.0),
+            normal: Vec3::Z,
+            aim_dir: aim * 2.5, // unnormalized input should normalize cleanly
+            standoff: 0.14,
+            feed_speed: 0.40,
+            valve_on: true,
+            opacity_scale: 1.0,
+            cap: NozzleCap::Fat,
+        };
+        let noz = wp.nozzle_pos();
+        let dir = wp.spray_dir();
+        assert_relative_eq!(dir.length(), 1.0, epsilon = 1e-6);
+        assert_relative_eq!((noz - wp.pos).length(), wp.standoff, epsilon = 1e-6);
+
+        // Ray from nozzle along spray_dir for `standoff` meters lands exactly on `wp.pos`
+        let hit = noz + dir * wp.standoff;
+        assert_relative_eq!(hit.x, wp.pos.x, epsilon = 1e-6);
+        assert_relative_eq!(hit.y, wp.pos.y, epsilon = 1e-6);
+        assert_relative_eq!(hit.z, wp.pos.z, epsilon = 1e-6);
+
+        // normal stays flat outward canvas normal (+Z)
+        assert_relative_eq!(wp.normal.z, 1.0, epsilon = 1e-6);
     }
 
     #[test]

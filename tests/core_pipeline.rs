@@ -6,9 +6,19 @@ use spraybot::core::palette::quantize_palette;
 use spraybot::core::planner::{PlannerConfig, plan_job};
 use spraybot::core::svg_ingest::{IngestConfig, ingest_svg_file};
 use spraybot::core::trajectory::CompiledTimeline;
-use spraybot::core::types::{JobOp, StudioConfig};
+use spraybot::core::types::{
+    JobOp, JobPlan, NormalizedPrimitive, NozzleCap, RobotFrameState, StudioConfig,
+};
 
-fn verify_svg_end_to_end(rel_path: &str, max_cans: usize) {
+struct PipelineVerifyResult {
+    primitives: Vec<NormalizedPrimitive>,
+    job: JobPlan,
+    duration: f64,
+    saw_fat_spray: bool,
+    saw_skinny_spray: bool,
+}
+
+fn verify_svg_end_to_end(rel_path: &str, max_cans: usize) -> PipelineVerifyResult {
     let studio = StudioConfig::default();
     let chain = KinematicChain::default_spraybot(&studio);
 
@@ -72,11 +82,16 @@ fn verify_svg_end_to_end(rel_path: &str, max_cans: usize) {
     assert_eq!(end.held_can_slot, None);
     assert!(!end.spray_active);
 
-    // Sample densely across the full timeline
-    let samples = 600usize;
+    // Sample at 60 Hz across the full timeline from 0.0 to timeline.duration()
+    let sample_rate_hz = 60.0_f64;
+    let step_count = (duration * sample_rate_hz).ceil() as usize;
     let mut spray_count = 0usize;
-    for i in 0..=samples {
-        let t = duration * (i as f64) / (samples as f64);
+    let mut prev_frame: Option<RobotFrameState> = None;
+    let mut saw_fat_spray = false;
+    let mut saw_skinny_spray = false;
+
+    for i in 0..=step_count {
+        let t = (i as f64 / sample_rate_hz).min(duration);
         let frame = timeline.sample(t);
 
         for (j, val) in frame.joints.iter().enumerate() {
@@ -90,11 +105,33 @@ fn verify_svg_end_to_end(rel_path: &str, max_cans: usize) {
             "{rel_path}: joint limit violation at t={t:.3}: {:?}",
             frame.joints
         );
+        let min_z = chain.min_world_z(&frame.joints, frame.held_can_slot.is_some());
+        assert!(
+            min_z > 0.008,
+            "{rel_path}: Z-clearance violation at t={t:.3}: min_world_z={min_z:.4} <= 0.008 (held={:?})",
+            frame.held_can_slot
+        );
         assert!(frame.nozzle_world_pos.is_finite());
         assert!(frame.nozzle_world_dir.is_finite());
 
+        if let Some(s0) = prev_frame {
+            if s0.spray_active && frame.spray_active {
+                let max_dof = (0..7)
+                    .map(|dof| (frame.joints[dof] - s0.joints[dof]).abs())
+                    .fold(0.0_f64, f64::max);
+                assert!(
+                    max_dof < 0.12,
+                    "{rel_path}: mid-spray IK jump at t={t:.3}: max_dof={max_dof:.4} >= 0.12"
+                );
+            }
+        }
+
         if frame.spray_active {
             spray_count += 1;
+            match frame.active_cap {
+                NozzleCap::Fat => saw_fat_spray = true,
+                NozzleCap::Skinny => saw_skinny_spray = true,
+            }
             assert!(
                 frame.held_can_slot.is_some(),
                 "{rel_path}: spraying without held can at t={t:.3}"
@@ -129,12 +166,27 @@ fn verify_svg_end_to_end(rel_path: &str, max_cans: usize) {
                 hit.y
             );
         }
+
+        prev_frame = Some(frame);
     }
 
     assert!(
         spray_count > 10,
         "{rel_path}: expected substantial active spray samples, got {spray_count}"
     );
+    println!(
+        "{rel_path}: timeline.duration() = {duration:.2}s ({} ops, {} samples @ 60 Hz, {spray_count} active spray samples)",
+        job.ops.len(),
+        step_count + 1
+    );
+
+    PipelineVerifyResult {
+        primitives,
+        job,
+        duration,
+        saw_fat_spray,
+        saw_skinny_spray,
+    }
 }
 
 #[test]
@@ -144,7 +196,34 @@ fn core_pipeline_01_geometric_shapes() {
 
 #[test]
 fn core_pipeline_02_street_art_poster() {
-    verify_svg_end_to_end("assets/examples/02_street_art_poster.svg", 16);
+    let res = verify_svg_end_to_end("assets/examples/02_street_art_poster.svg", 16);
+    assert!(
+        res.duration < 2500.0,
+        "02_street_art_poster.svg: expected timeline duration < 2500s, got {:.2}s",
+        res.duration
+    );
+    assert!(
+        res.job
+            .ops
+            .iter()
+            .any(|op| matches!(op, JobOp::SwapCap { cap: NozzleCap::Skinny })),
+        "02_street_art_poster.svg: expected JobOp::SwapCap {{ cap: NozzleCap::Skinny }}"
+    );
+    assert!(
+        res.saw_fat_spray && res.saw_skinny_spray,
+        "02_street_art_poster.svg: expected both Fat and Skinny active spray samples (fat={}, skinny={})",
+        res.saw_fat_spray,
+        res.saw_skinny_spray
+    );
+    let gradient_count = res
+        .primitives
+        .iter()
+        .filter(|p| p.gradient_meta.is_some())
+        .count();
+    assert!(
+        gradient_count > 0,
+        "02_street_art_poster.svg: expected gradient primitives with gradient_meta.is_some()"
+    );
 }
 
 #[test]

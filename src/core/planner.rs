@@ -254,9 +254,9 @@ fn plan_single_polygon(
         .map(|bb| bb.width().min(bb.height()))
         .unwrap_or(0.0);
     let fat_perim_mp = filter_valid_mp(poly.buffer(-fat_inset));
-    let use_skinny = minor_dim < 0.045
+    let use_skinny = minor_dim < 0.024
         || fat_perim_mp.0.is_empty()
-        || fat_perim_mp.unsigned_area() < 0.25 * area;
+        || fat_perim_mp.unsigned_area() < 0.15 * area;
 
     let (cap, perim_mp, d_perim, inset_perim, w_perim) = if use_skinny {
         let (_, d_p, _) = cap_standoff_bounds(NozzleCap::Skinny, config);
@@ -313,7 +313,7 @@ fn plan_gradient_multipolygon(
             let d_fill = ((*band_width as f32 * 0.45)
                 / (2.0 * NozzleCap::Fat.cone_half_angle_rad().tan()))
             .clamp(0.12, 0.25);
-            let step_over = (0.50 * spot_width_cap(NozzleCap::Fat, d_fill) as f64).max(0.012);
+            let step_over = (0.62 * spot_width_cap(NozzleCap::Fat, d_fill) as f64).max(0.012);
             let perp = DVec2::new(-dir.y, dir.x);
 
             for poly in &mp.0 {
@@ -356,7 +356,7 @@ fn plan_gradient_multipolygon(
             let d_fill = ((*band_width as f32 * 0.45)
                 / (2.0 * NozzleCap::Fat.cone_half_angle_rad().tan()))
             .clamp(0.12, 0.25);
-            let step_over = (0.50 * spot_width_cap(NozzleCap::Fat, d_fill) as f64).max(0.012);
+            let step_over = (0.62 * spot_width_cap(NozzleCap::Fat, d_fill) as f64).max(0.012);
 
             for poly in &mp.0 {
                 if poly.unsigned_area() < MIN_AREA_M2 {

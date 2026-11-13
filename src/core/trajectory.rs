@@ -231,7 +231,7 @@ impl CompiledTimeline {
         let mut segments: Vec<TimelineSegment> = Vec::new();
         let mut t_cursor = 0.0_f64;
 
-        for op in &job.ops {
+        for (op_idx, op) in job.ops.iter().enumerate() {
             match op {
                 JobOp::PickCan { slot } => {
                     let slot_pose = slots.get(*slot).ok_or_else(|| {
@@ -468,20 +468,26 @@ impl CompiledTimeline {
                     let wp0_noz = wp0.nozzle_pos();
                     let wp0_dir = wp0.spray_dir();
 
-                    let p_retract_start =
-                        Vec3::new(wp0_noz.x, wp0_noz.y, wp0_noz.z.max(SAFE_TRANSIT_Z));
-
-                    // Check if currently facing canvas safely; if so use safe-Z Cartesian spline,
-                    // otherwise (e.g. coming from rack/home) use safe folded joint-space transit.
+                    // Check if currently facing canvas safely; if so use adaptive-Z Cartesian hop,
+                    // otherwise (e.g. coming from rack/home/swap) use safe folded joint-space transit.
                     let (cur_noz, cur_dir, _) = chain.fk_nozzle(&q_curr);
                     let canvas_left = studio.canvas_center.x - studio.canvas_width * 0.6;
                     let facing_wall = cur_dir.z < -0.7
-                        && cur_noz.z >= SAFE_TRANSIT_Z - 0.02
+                        && cur_noz.z >= 0.08
                         && cur_noz.x >= canvas_left;
+
+                    let dist_xy = ((cur_noz.x - wp0_noz.x).powi(2) + (cur_noz.y - wp0_noz.y).powi(2)).sqrt();
+                    let hop_z = if facing_wall && dist_xy <= 0.45 {
+                        cur_noz.z.max((wp0_noz.z + 0.08).clamp(0.12, 0.24))
+                    } else {
+                        SAFE_TRANSIT_Z
+                    };
+                    let p_retract_start =
+                        Vec3::new(wp0_noz.x, wp0_noz.y, wp0_noz.z.max(hop_z));
 
                     if facing_wall && (cur_noz - p_retract_start).length() > 1e-3 {
                         let p_cur_safe =
-                            Vec3::new(cur_noz.x, cur_noz.y, cur_noz.z.max(SAFE_TRANSIT_Z));
+                            Vec3::new(cur_noz.x, cur_noz.y, cur_noz.z.max(hop_z));
                         if (p_cur_safe - cur_noz).length() > 1e-3 {
                             if let Ok((seg, q_next)) = build_cartesian_nozzle_segment(
                                 chain,
@@ -490,8 +496,8 @@ impl CompiledTimeline {
                                 p_cur_safe,
                                 cur_dir,
                                 wp0_dir,
-                                0.65,
-                                1.8,
+                                1.05,
+                                3.2,
                                 gripper_open,
                                 held_can_slot,
                                 active_cap,
@@ -509,8 +515,8 @@ impl CompiledTimeline {
                             p_retract_start,
                             cur_dir,
                             wp0_dir,
-                            0.85,
-                            2.0,
+                            1.45,
+                            3.8,
                             gripper_open,
                             held_can_slot,
                             active_cap,
@@ -558,7 +564,7 @@ impl CompiledTimeline {
                         q_curr = q_retract_start;
                     }
 
-                    // Descend from safe Z to first stroke waypoint
+                    // Descend from hop/safe Z to first stroke waypoint
                     if (p_retract_start - wp0_noz).length() > 1e-3 {
                         if let Ok((desc_seg, q_at_wp0)) = build_cartesian_nozzle_segment(
                             chain,
@@ -567,8 +573,8 @@ impl CompiledTimeline {
                             wp0_noz,
                             wp0_dir,
                             wp0_dir,
-                            0.45,
-                            1.4,
+                            1.05,
+                            3.2,
                             gripper_open,
                             held_can_slot,
                             active_cap,
@@ -611,12 +617,28 @@ impl CompiledTimeline {
                         )?;
                     }
 
-                    // Retract to safe Z on stroke end
+                    // Retract to adaptive hop Z (if next op is a nearby stroke) or SAFE_TRANSIT_Z
                     let wp_last = points_canvas_3d[points_canvas_3d.len() - 1];
                     let p_last = wp_last.nozzle_pos();
                     let d_last = wp_last.spray_dir();
-                    if p_last.z < SAFE_TRANSIT_Z - 1e-3 {
-                        let p_retract_end = Vec3::new(p_last.x, p_last.y, SAFE_TRANSIT_Z);
+                    let next_retract_z = match job.ops.get(op_idx + 1) {
+                        Some(JobOp::PaintStroke { points_canvas_3d: next_pts })
+                            if !next_pts.is_empty() =>
+                        {
+                            let next_wp0 = next_pts[0].nozzle_pos();
+                            let next_dist_xy = ((p_last.x - next_wp0.x).powi(2)
+                                + (p_last.y - next_wp0.y).powi(2))
+                            .sqrt();
+                            if next_dist_xy <= 0.45 {
+                                (p_last.z.max(next_wp0.z) + 0.08).clamp(0.12, 0.24)
+                            } else {
+                                SAFE_TRANSIT_Z
+                            }
+                        }
+                        _ => SAFE_TRANSIT_Z,
+                    };
+                    if p_last.z < next_retract_z - 1e-3 {
+                        let p_retract_end = Vec3::new(p_last.x, p_last.y, next_retract_z);
                         if let Ok((ret_seg, q_retracted)) = build_cartesian_nozzle_segment(
                             chain,
                             q_curr,
@@ -624,8 +646,8 @@ impl CompiledTimeline {
                             p_retract_end,
                             d_last,
                             d_last,
-                            0.45,
-                            1.4,
+                            1.05,
+                            3.2,
                             gripper_open,
                             held_can_slot,
                             active_cap,
@@ -987,8 +1009,102 @@ fn push_raw_joint_move(
     }
 }
 
-/// Pushes a collision-free joint-space transit, folding into a high-clearance posture whenever
-/// direct joint interpolation would dip near the wall canvas (`min_world_z < 0.18m`).
+/// Pushes a joint-space segment, staging through a shoulder-retracted posture (`q2 = +0.45`)
+/// whenever direct interpolation would bring any link or held can within `0.06m` of `Z = 0`.
+#[allow(clippy::too_many_arguments)]
+fn push_checked_joint_move(
+    chain: &KinematicChain,
+    segments: &mut Vec<TimelineSegment>,
+    t_cursor: &mut f64,
+    q_from: [f64; 7],
+    q_to: [f64; 7],
+    g_open: f32,
+    can_slot: Option<usize>,
+    active_cap: NozzleCap,
+) {
+    let held_can = can_slot.is_some();
+    let end_floor = chain
+        .min_world_z(&q_from, held_can)
+        .min(chain.min_world_z(&q_to, held_can))
+        .min(0.06)
+        .max(0.012)
+        - 0.002;
+    if min_joint_path_z(chain, &q_from, &q_to, held_can, 40) >= end_floor.max(0.04) {
+        push_raw_joint_move(
+            chain, segments, t_cursor, q_from, q_to, g_open, can_slot, active_cap,
+        );
+        return;
+    }
+
+    // At q2 = +0.45 (shoulder pitched back), wrist Z >= 0.64m regardless of q3/q5.
+    // Stage: (optional Cartesian +Z retract) -> q2 = 0.45 -> move other joints at q2 = 0.45 -> move q2 to q_to[2].
+    let mut q_cur = q_from;
+    let q_retract_a = chain.clamp_joints(&[
+        q_cur[0], q_cur[1], 0.45, q_cur[3], q_cur[4], q_cur[5], q_cur[6],
+    ]);
+    if min_joint_path_z(chain, &q_cur, &q_retract_a, held_can, 40) < end_floor {
+        let (noz, dir, _) = chain.fk_nozzle(&q_cur);
+        if dir.z < -0.4 && noz.z < 0.46 {
+            let p_safe = Vec3::new(noz.x, noz.y, 0.50_f32.max(noz.z + 0.14));
+            if let Ok((seg, q_safe)) = build_cartesian_nozzle_segment(
+                chain, q_cur, noz, p_safe, dir, dir, 0.75, 2.0, g_open, can_slot, active_cap,
+                *t_cursor,
+            ) {
+                *t_cursor = seg.t_end;
+                segments.push(seg);
+                q_cur = q_safe;
+            }
+        }
+    }
+
+    let q_back_from = chain.clamp_joints(&[
+        q_cur[0], q_cur[1], 0.45, q_cur[3], q_cur[4], q_cur[5], q_cur[6],
+    ]);
+    let q_back_to = chain.clamp_joints(&[
+        q_to[0], q_to[1], 0.45, q_to[3], q_to[4], q_to[5], q_to[6],
+    ]);
+    let z_1 = min_joint_path_z(chain, &q_cur, &q_back_from, held_can, 40);
+    let z_2 = min_joint_path_z(chain, &q_back_from, &q_back_to, held_can, 40);
+    let z_3 = min_joint_path_z(chain, &q_back_to, &q_to, held_can, 40);
+    if z_1 >= end_floor && z_2 >= 0.06 && z_3 >= end_floor {
+        push_raw_joint_move(
+            chain, segments, t_cursor, q_cur, q_back_from, g_open, can_slot, active_cap,
+        );
+        push_raw_joint_move(
+            chain, segments, t_cursor, q_back_from, q_back_to, g_open, can_slot, active_cap,
+        );
+        push_raw_joint_move(
+            chain, segments, t_cursor, q_back_to, q_to, g_open, can_slot, active_cap,
+        );
+        return;
+    }
+
+    // Fallback: tuck via PARK_HOME arm posture at q2 = 0.45
+    let q_park_from = chain.clamp_joints(&[q_cur[0], q_cur[1], 0.45, 1.10, 0.0, -1.25, 0.0]);
+    let q_park_to = chain.clamp_joints(&[q_to[0], q_to[1], 0.45, 1.10, 0.0, -1.25, 0.0]);
+    let pz1 = min_joint_path_z(chain, &q_cur, &q_park_from, held_can, 40);
+    let pz2 = min_joint_path_z(chain, &q_park_from, &q_park_to, held_can, 40);
+    let pz3 = min_joint_path_z(chain, &q_park_to, &q_to, held_can, 40);
+    if pz1.min(pz2).min(pz3) > min_joint_path_z(chain, &q_cur, &q_to, held_can, 40) {
+        push_raw_joint_move(
+            chain, segments, t_cursor, q_cur, q_park_from, g_open, can_slot, active_cap,
+        );
+        push_raw_joint_move(
+            chain, segments, t_cursor, q_park_from, q_park_to, g_open, can_slot, active_cap,
+        );
+        push_raw_joint_move(
+            chain, segments, t_cursor, q_park_to, q_to, g_open, can_slot, active_cap,
+        );
+        return;
+    }
+
+    push_raw_joint_move(
+        chain, segments, t_cursor, q_cur, q_to, g_open, can_slot, active_cap,
+    );
+}
+
+/// Pushes a collision-free joint-space transit, retracting along Cartesian `+Z` when near the wall
+/// and folding into a high-clearance posture whenever direct joint interpolation would dip (`min_world_z < 0.18m`).
 #[allow(clippy::too_many_arguments)]
 fn push_safe_joint_move(
     chain: &KinematicChain,
@@ -1001,8 +1117,7 @@ fn push_safe_joint_move(
     active_cap: NozzleCap,
 ) {
     let held_can = can_slot.is_some();
-    let min_z = min_joint_path_z(chain, &q_from, &q_to, held_can, 40);
-    if min_z >= 0.18 {
+    if min_joint_path_z(chain, &q_from, &q_to, held_can, 40) >= 0.18 {
         push_raw_joint_move(
             chain, segments, t_cursor, q_from, q_to, g_open, can_slot, active_cap,
         );
@@ -1015,84 +1130,112 @@ fn push_safe_joint_move(
 
     let mut q_cur = q_from;
     let (from_noz, from_dir, _) = chain.fk_nozzle(&q_from);
-    let q_tuck_from = tuck_arm(&q_from);
-    let min_z_fold = min_joint_path_z(chain, &q_from, &q_tuck_from, held_can, 40);
-    if min_z_fold < 0.08 && from_dir.z < -0.5 && from_noz.z < 0.25 {
-        if let Ok(q_safe_from) = chain.solve_ik(
-            &q_from,
-            Vec3::new(from_noz.x, from_noz.y, SAFE_TRANSIT_Z.max(from_noz.z + 0.08)),
+    if from_dir.z < -0.5 && from_noz.z < 0.46 {
+        let safe_z = 0.50_f32.max(from_noz.z + 0.14);
+        let p_safe_from = Vec3::new(from_noz.x, from_noz.y, safe_z);
+        if let Ok((seg, q_safe_from)) = build_cartesian_nozzle_segment(
+            chain,
+            q_cur,
+            from_noz,
+            p_safe_from,
             from_dir,
-            IkMode::Spray { roll_weight: 0.15 },
+            from_dir,
+            0.75,
+            2.0,
+            g_open,
+            can_slot,
+            active_cap,
+            *t_cursor,
         ) {
-            if min_joint_path_z(chain, &q_from, &q_safe_from, held_can, 40) > min_z_fold {
-                push_raw_joint_move(
-                    chain,
-                    segments,
-                    t_cursor,
-                    q_cur,
-                    q_safe_from,
-                    g_open,
-                    can_slot,
-                    active_cap,
-                );
+            if min_joint_path_z(chain, &q_cur, &q_safe_from, held_can, 20) >= 0.02 {
+                *t_cursor = seg.t_end;
+                segments.push(seg);
                 q_cur = q_safe_from;
             }
         }
     }
 
-    let yaw_crosses_wide = (q_cur[1] - q_to[1]).abs() > 0.35;
-    if yaw_crosses_wide || min_z < 0.18 {
-        let q_fold_cur = tuck_arm(&q_cur);
+    if min_joint_path_z(chain, &q_cur, &q_to, held_can, 40) >= 0.18 {
         push_raw_joint_move(
-            chain,
-            segments,
-            t_cursor,
-            q_cur,
-            q_fold_cur,
-            g_open,
-            can_slot,
-            active_cap,
+            chain, segments, t_cursor, q_cur, q_to, g_open, can_slot, active_cap,
         );
-        q_cur = q_fold_cur;
+        return;
     }
 
-    let q_sweep = chain.clamp_joints(&[
-        q_to[0],
-        q_to[1].clamp(-1.35, 1.35),
-        0.15,
-        1.10,
-        0.0,
-        -1.25,
-        0.0,
-    ]);
-    push_raw_joint_move(
-        chain, segments, t_cursor, q_cur, q_sweep, g_open, can_slot, active_cap,
-    );
-    q_cur = q_sweep;
-
+    // If destination is near the wall, stage through a high-Z pose above it and descend linearly in -Z.
     let (to_noz, to_dir, _) = chain.fk_nozzle(&q_to);
-    let min_z_unfold = min_joint_path_z(chain, &q_cur, &q_to, held_can, 40);
-    if (to_noz.z < 0.25 && to_dir.z < -0.5) || min_z_unfold < 0.05 {
+    let mut descend_seg: Option<(TimelineSegment, [f64; 7])> = None;
+    let mut q_target = q_to;
+    if to_dir.z < -0.5 && to_noz.z < 0.46 {
+        let safe_z = 0.50_f32.max(to_noz.z + 0.14);
+        let p_safe_to = Vec3::new(to_noz.x, to_noz.y, safe_z);
         if let Ok(q_safe_to) = chain.solve_ik(
             &q_to,
-            Vec3::new(to_noz.x, to_noz.y, SAFE_TRANSIT_Z.max(to_noz.z + 0.08)),
+            p_safe_to,
             to_dir,
             IkMode::Spray { roll_weight: 0.15 },
         ) {
-            let z_a = min_joint_path_z(chain, &q_cur, &q_safe_to, held_can, 40);
-            let z_b = min_joint_path_z(chain, &q_safe_to, &q_to, held_can, 40);
-            if z_a.min(z_b) > min_z_unfold {
-                push_raw_joint_move(
-                    chain, segments, t_cursor, q_cur, q_safe_to, g_open, can_slot, active_cap,
-                );
-                q_cur = q_safe_to;
+            if let Ok((seg, q_desc_end)) = build_cartesian_nozzle_segment(
+                chain,
+                q_safe_to,
+                p_safe_to,
+                to_noz,
+                to_dir,
+                to_dir,
+                0.75,
+                2.0,
+                g_open,
+                can_slot,
+                active_cap,
+                0.0,
+            ) {
+                let end_floor = chain.min_world_z(&q_to, held_can).min(0.06) - 0.002;
+                if min_joint_path_z(chain, &q_desc_end, &q_to, held_can, 16) >= end_floor {
+                    q_target = q_safe_to;
+                    descend_seg = Some((seg, q_desc_end));
+                }
             }
         }
     }
 
-    push_raw_joint_move(
-        chain, segments, t_cursor, q_cur, q_to, g_open, can_slot, active_cap,
-    );
+    if min_joint_path_z(chain, &q_cur, &q_target, held_can, 40) >= 0.18 {
+        push_raw_joint_move(
+            chain, segments, t_cursor, q_cur, q_target, g_open, can_slot, active_cap,
+        );
+    } else {
+        let q_fold_cur = tuck_arm(&q_cur);
+        push_checked_joint_move(
+            chain, segments, t_cursor, q_cur, q_fold_cur, g_open, can_slot, active_cap,
+        );
+
+        let q_sweep = chain.clamp_joints(&[
+            q_target[0],
+            q_target[1].clamp(-1.35, 1.35),
+            0.15,
+            1.10,
+            0.0,
+            -1.25,
+            0.0,
+        ]);
+        push_checked_joint_move(
+            chain, segments, t_cursor, q_fold_cur, q_sweep, g_open, can_slot, active_cap,
+        );
+
+        push_checked_joint_move(
+            chain, segments, t_cursor, q_sweep, q_target, g_open, can_slot, active_cap,
+        );
+    }
+
+    if let Some((mut seg, q_desc_end)) = descend_seg {
+        let dt = seg.t_end - seg.t_start;
+        seg.t_start = *t_cursor;
+        seg.t_end = *t_cursor + dt;
+        *t_cursor = seg.t_end;
+        segments.push(seg);
+        push_raw_joint_move(
+            chain, segments, t_cursor, q_desc_end, q_to, g_open, can_slot, active_cap,
+        );
+    }
 }
 
 /// Computes synchronized joint-space S-curve profile strictly respecting all joint velocity & accel limits.
@@ -1222,7 +1365,7 @@ fn build_cartesian_nozzle_segment(
     t_start: f64,
 ) -> Result<(TimelineSegment, [f64; 7]), String> {
     let dist = (pos_end - pos_start).length() as f64;
-    let steps = ((dist / 0.012).ceil() as usize).clamp(4, 250);
+    let steps = ((dist / 0.004).ceil() as usize).clamp(4, 300);
 
     let mut samples = Vec::with_capacity(steps + 1);
     samples.push(PathSample {
@@ -1317,7 +1460,7 @@ fn finalize_timed_stroke(
         let cos_a = d1.dot(d2).clamp(-1.0, 1.0) as f64;
         if cos_a < 0.96 {
             let corner_factor = ((1.0 + cos_a) * 0.5).max(0.0).sqrt();
-            v_lim[j] *= corner_factor.max(0.12);
+            v_lim[j] *= corner_factor.max(0.28);
         }
     }
 

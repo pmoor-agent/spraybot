@@ -15,6 +15,8 @@ const RACK_APPROACH_DIST: f32 = 0.14;
 const RACK_LIFT_HEIGHT: f32 = 0.06;
 /// Duration of gripper open/close actuation (seconds).
 const GRIPPER_ACTUATE_DURATION: f64 = 0.25;
+/// Duration of pneumatic cap-swap dwell at cap station dock (seconds).
+const CAP_SWAP_DWELL_DURATION: f64 = 0.18;
 /// Duration of can shake operation (seconds).
 const SHAKE_DURATION: f64 = 1.1;
 /// Shake oscillation frequency (Hz).
@@ -22,7 +24,7 @@ const SHAKE_FREQ_HZ: f64 = 6.0;
 /// Shake oscillation amplitude in radians (`±22°`).
 const SHAKE_AMP_RAD: f64 = 22.0_f64 * PI / 180.0;
 /// Unobstructed side park pose at the right end of the rail (`q0 = 1.38m > +1.25m` canvas edge).
-const PARK_HOME_JOINTS: [f64; 7] = [1.38, -0.35, -0.55, 1.40, 0.0, -0.85, 0.0];
+const PARK_HOME_JOINTS: [f64; 7] = [1.38, -0.25, 0.15, 1.10, 0.0, -1.25, 0.0];
 
 /// Symmetric smooth-ramp (`C²` continuous) S-curve 1D time-scaling profile on `[0, duration]`.
 #[derive(Debug, Clone, Copy)]
@@ -108,6 +110,7 @@ struct PathSample {
     joints: [f64; 7],
     valve_on: bool,
     opacity_scale: f32,
+    cap: NozzleCap,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +121,7 @@ enum SegmentKind {
         profile: SCurveProfile,
         gripper_open: f32,
         held_can_slot: Option<usize>,
+        active_cap: NozzleCap,
     },
     GripperActuate {
         q: [f64; 7],
@@ -125,6 +129,15 @@ enum SegmentKind {
         open_end: f32,
         slot_before: Option<usize>,
         slot_after: Option<usize>,
+        cap_before: NozzleCap,
+        cap_after: NozzleCap,
+        switch_at: f32,
+    },
+    CapSwitchHold {
+        q: [f64; 7],
+        held_can_slot: Option<usize>,
+        cap_before: NozzleCap,
+        cap_after: NozzleCap,
         switch_at: f32,
     },
     ShakeMove {
@@ -132,12 +145,14 @@ enum SegmentKind {
         pitch_bounds: (f64, f64),
         roll_bounds: (f64, f64),
         held_can_slot: Option<usize>,
+        active_cap: NozzleCap,
     },
     ArcScaledPath {
         samples: Vec<PathSample>,
         profile: SCurveProfile,
         gripper_open: f32,
         held_can_slot: Option<usize>,
+        active_cap: NozzleCap,
     },
     TimedStroke {
         samples: Vec<PathSample>,
@@ -210,33 +225,11 @@ impl CompiledTimeline {
         let mut q_curr = home;
         let mut gripper_open: f32 = 1.0;
         let mut held_can_slot: Option<usize> = None;
+        let mut slot_caps = vec![NozzleCap::Fat; rack_cap];
+        let mut active_cap = NozzleCap::Fat;
 
         let mut segments: Vec<TimelineSegment> = Vec::new();
         let mut t_cursor = 0.0_f64;
-
-        let push_joint_move = |segments: &mut Vec<TimelineSegment>,
-                               t_cursor: &mut f64,
-                               q_from: [f64; 7],
-                               q_to: [f64; 7],
-                               g_open: f32,
-                               can_slot: Option<usize>| {
-            let profile = joint_move_profile(chain, &q_from, &q_to);
-            if profile.duration > 1e-6 {
-                let t_end = *t_cursor + profile.duration;
-                segments.push(TimelineSegment {
-                    t_start: *t_cursor,
-                    t_end,
-                    kind: SegmentKind::JointMove {
-                        q_start: q_from,
-                        q_end: q_to,
-                        profile,
-                        gripper_open: g_open,
-                        held_can_slot: can_slot,
-                    },
-                });
-                *t_cursor = t_end;
-            }
-        };
 
         for op in &job.ops {
             match op {
@@ -253,13 +246,15 @@ impl CompiledTimeline {
                     // 1. Move to rack approach
                     let q_approach =
                         chain.solve_ik_grasp(&q_curr, approach_pos, slot_pose.grasp_rot)?;
-                    push_joint_move(
+                    push_safe_joint_move(
+                        chain,
                         &mut segments,
                         &mut t_cursor,
                         q_curr,
                         q_approach,
                         gripper_open,
                         held_can_slot,
+                        active_cap,
                     );
                     q_curr = q_approach;
 
@@ -274,6 +269,7 @@ impl CompiledTimeline {
                         1.0,
                         gripper_open,
                         held_can_slot,
+                        active_cap,
                         t_cursor,
                     )?;
                     t_cursor = insert_seg.t_end;
@@ -281,6 +277,7 @@ impl CompiledTimeline {
                     q_curr = q_after_insert;
 
                     // 3. 0.25s gripper close (1.0 -> 0.0, held_can_slot = Some(slot))
+                    let next_cap = slot_caps[*slot];
                     let t_end_close = t_cursor + GRIPPER_ACTUATE_DURATION;
                     segments.push(TimelineSegment {
                         t_start: t_cursor,
@@ -291,12 +288,15 @@ impl CompiledTimeline {
                             open_end: 0.0,
                             slot_before: held_can_slot,
                             slot_after: Some(*slot),
+                            cap_before: active_cap,
+                            cap_after: next_cap,
                             switch_at: 0.85,
                         },
                     });
                     t_cursor = t_end_close;
                     gripper_open = 0.0;
                     held_can_slot = Some(*slot);
+                    active_cap = next_cap;
 
                     // 4. 0.06m vertical +Y lift
                     let (lift_seg, q_after_lift) = build_cartesian_grasp_segment(
@@ -309,6 +309,7 @@ impl CompiledTimeline {
                         0.8,
                         gripper_open,
                         held_can_slot,
+                        active_cap,
                         t_cursor,
                     )?;
                     t_cursor = lift_seg.t_end;
@@ -326,6 +327,7 @@ impl CompiledTimeline {
                         1.0,
                         gripper_open,
                         held_can_slot,
+                        active_cap,
                         t_cursor,
                     )?;
                     t_cursor = retract_seg.t_end;
@@ -343,9 +345,119 @@ impl CompiledTimeline {
                             pitch_bounds: (chain.joints[5].min, chain.joints[5].max),
                             roll_bounds: (chain.joints[4].min, chain.joints[4].max),
                             held_can_slot,
+                            active_cap,
                         },
                     });
                     t_cursor = t_end;
+                }
+
+                JobOp::SwapCap { cap } => {
+                    let docks = studio.cap_station_poses(rack_cap);
+                    let dock = match cap {
+                        NozzleCap::Fat => docks[0],
+                        NozzleCap::Skinny => docks[1],
+                    };
+                    let pre_dock = dock.grasp_pos + dock.approach_dir * 0.12 + Vec3::Y * 0.04;
+                    let above_dock = dock.grasp_pos + Vec3::Y * 0.035;
+
+                    let q_pre = chain.solve_ik_grasp(&q_curr, pre_dock, dock.grasp_rot)?;
+                    push_safe_joint_move(
+                        chain,
+                        &mut segments,
+                        &mut t_cursor,
+                        q_curr,
+                        q_pre,
+                        gripper_open,
+                        held_can_slot,
+                        active_cap,
+                    );
+                    q_curr = q_pre;
+
+                    let (approach_seg, q_above) = build_cartesian_grasp_segment(
+                        chain,
+                        q_curr,
+                        pre_dock,
+                        above_dock,
+                        dock.grasp_rot,
+                        0.32,
+                        1.0,
+                        gripper_open,
+                        held_can_slot,
+                        active_cap,
+                        t_cursor,
+                    )?;
+                    t_cursor = approach_seg.t_end;
+                    segments.push(approach_seg);
+                    q_curr = q_above;
+
+                    let (press_seg, q_dock) = build_cartesian_grasp_segment(
+                        chain,
+                        q_curr,
+                        above_dock,
+                        dock.grasp_pos,
+                        dock.grasp_rot,
+                        0.20,
+                        0.8,
+                        gripper_open,
+                        held_can_slot,
+                        active_cap,
+                        t_cursor,
+                    )?;
+                    t_cursor = press_seg.t_end;
+                    segments.push(press_seg);
+                    q_curr = q_dock;
+
+                    let t_end_dwell = t_cursor + CAP_SWAP_DWELL_DURATION;
+                    segments.push(TimelineSegment {
+                        t_start: t_cursor,
+                        t_end: t_end_dwell,
+                        kind: SegmentKind::CapSwitchHold {
+                            q: q_curr,
+                            held_can_slot,
+                            cap_before: active_cap,
+                            cap_after: *cap,
+                            switch_at: 0.5,
+                        },
+                    });
+                    t_cursor = t_end_dwell;
+                    active_cap = *cap;
+                    if let Some(slot) = held_can_slot {
+                        slot_caps[slot] = *cap;
+                    }
+
+                    let (lift_seg, q_lifted) = build_cartesian_grasp_segment(
+                        chain,
+                        q_curr,
+                        dock.grasp_pos,
+                        above_dock,
+                        dock.grasp_rot,
+                        0.22,
+                        0.8,
+                        gripper_open,
+                        held_can_slot,
+                        active_cap,
+                        t_cursor,
+                    )?;
+                    t_cursor = lift_seg.t_end;
+                    segments.push(lift_seg);
+                    q_curr = q_lifted;
+
+                    let (ret_seg, q_ret) = build_cartesian_grasp_segment(
+                        chain,
+                        q_curr,
+                        above_dock,
+                        pre_dock,
+                        dock.grasp_rot,
+                        0.32,
+                        1.0,
+                        gripper_open,
+                        held_can_slot,
+                        active_cap,
+                        t_cursor,
+                    )?;
+                    t_cursor = ret_seg.t_end;
+                    segments.push(ret_seg);
+                    q_curr = q_ret;
                 }
 
                 JobOp::PaintStroke { points_canvas_3d } => {
@@ -360,7 +472,7 @@ impl CompiledTimeline {
                         Vec3::new(wp0_noz.x, wp0_noz.y, wp0_noz.z.max(SAFE_TRANSIT_Z));
 
                     // Check if currently facing canvas safely; if so use safe-Z Cartesian spline,
-                    // otherwise (e.g. coming from rack/home) use smooth joint-space transit.
+                    // otherwise (e.g. coming from rack/home) use safe folded joint-space transit.
                     let (cur_noz, cur_dir, _) = chain.fk_nozzle(&q_curr);
                     let canvas_left = studio.canvas_center.x - studio.canvas_width * 0.6;
                     let facing_wall = cur_dir.z < -0.7
@@ -371,7 +483,7 @@ impl CompiledTimeline {
                         let p_cur_safe =
                             Vec3::new(cur_noz.x, cur_noz.y, cur_noz.z.max(SAFE_TRANSIT_Z));
                         if (p_cur_safe - cur_noz).length() > 1e-3 {
-                            let (seg, q_next) = build_cartesian_nozzle_segment(
+                            if let Ok((seg, q_next)) = build_cartesian_nozzle_segment(
                                 chain,
                                 q_curr,
                                 cur_noz,
@@ -382,11 +494,13 @@ impl CompiledTimeline {
                                 1.8,
                                 gripper_open,
                                 held_can_slot,
+                                active_cap,
                                 t_cursor,
-                            )?;
-                            t_cursor = seg.t_end;
-                            segments.push(seg);
-                            q_curr = q_next;
+                            ) {
+                                t_cursor = seg.t_end;
+                                segments.push(seg);
+                                q_curr = q_next;
+                            }
                         }
                         if let Ok((seg, q_next)) = build_cartesian_nozzle_segment(
                             chain,
@@ -399,6 +513,7 @@ impl CompiledTimeline {
                             2.0,
                             gripper_open,
                             held_can_slot,
+                            active_cap,
                             t_cursor,
                         ) {
                             t_cursor = seg.t_end;
@@ -411,37 +526,41 @@ impl CompiledTimeline {
                                 wp0_dir,
                                 IkMode::Spray { roll_weight: 0.15 },
                             )?;
-                            push_joint_move(
+                            push_safe_joint_move(
+                                chain,
                                 &mut segments,
                                 &mut t_cursor,
                                 q_curr,
                                 q_retract_start,
                                 gripper_open,
                                 held_can_slot,
+                                active_cap,
                             );
                             q_curr = q_retract_start;
                         }
-                    } else {
+                    } else if (cur_noz - p_retract_start).length() > 1e-3 {
                         let q_retract_start = chain.solve_ik(
                             &q_curr,
                             p_retract_start,
                             wp0_dir,
                             IkMode::Spray { roll_weight: 0.15 },
                         )?;
-                        push_joint_move(
+                        push_safe_joint_move(
+                            chain,
                             &mut segments,
                             &mut t_cursor,
                             q_curr,
                             q_retract_start,
                             gripper_open,
                             held_can_slot,
+                            active_cap,
                         );
                         q_curr = q_retract_start;
                     }
 
                     // Descend from safe Z to first stroke waypoint
                     if (p_retract_start - wp0_noz).length() > 1e-3 {
-                        let (desc_seg, q_at_wp0) = build_cartesian_nozzle_segment(
+                        if let Ok((desc_seg, q_at_wp0)) = build_cartesian_nozzle_segment(
                             chain,
                             q_curr,
                             p_retract_start,
@@ -452,28 +571,44 @@ impl CompiledTimeline {
                             1.4,
                             gripper_open,
                             held_can_slot,
+                            active_cap,
                             t_cursor,
-                        )?;
-                        t_cursor = desc_seg.t_end;
-                        segments.push(desc_seg);
-                        q_curr = q_at_wp0;
+                        ) {
+                            t_cursor = desc_seg.t_end;
+                            segments.push(desc_seg);
+                            q_curr = q_at_wp0;
+                        } else {
+                            let q_at_wp0 = chain.solve_ik(
+                                &q_curr,
+                                wp0_noz,
+                                wp0_dir,
+                                IkMode::Spray { roll_weight: 0.15 },
+                            )?;
+                            push_safe_joint_move(
+                                chain,
+                                &mut segments,
+                                &mut t_cursor,
+                                q_curr,
+                                q_at_wp0,
+                                gripper_open,
+                                held_can_slot,
+                                active_cap,
+                            );
+                            q_curr = q_at_wp0;
+                        }
                     }
 
-                    // Dense continuous IK tracking along stroke waypoints
+                    // Dense continuous IK tracking along stroke waypoints (splitting cleanly on reconfig)
                     if points_canvas_3d.len() >= 2 {
-                        let (stroke_seg, q_end_stroke) = build_timed_stroke_segment(
+                        q_curr = build_timed_stroke_segments(
                             chain,
                             q_curr,
                             points_canvas_3d,
                             gripper_open,
                             held_can_slot,
-                            t_cursor,
+                            &mut segments,
+                            &mut t_cursor,
                         )?;
-                        if stroke_seg.t_end > stroke_seg.t_start + 1e-6 {
-                            t_cursor = stroke_seg.t_end;
-                            segments.push(stroke_seg);
-                        }
-                        q_curr = q_end_stroke;
                     }
 
                     // Retract to safe Z on stroke end
@@ -482,7 +617,7 @@ impl CompiledTimeline {
                     let d_last = wp_last.spray_dir();
                     if p_last.z < SAFE_TRANSIT_Z - 1e-3 {
                         let p_retract_end = Vec3::new(p_last.x, p_last.y, SAFE_TRANSIT_Z);
-                        let (ret_seg, q_retracted) = build_cartesian_nozzle_segment(
+                        if let Ok((ret_seg, q_retracted)) = build_cartesian_nozzle_segment(
                             chain,
                             q_curr,
                             p_last,
@@ -493,11 +628,31 @@ impl CompiledTimeline {
                             1.4,
                             gripper_open,
                             held_can_slot,
+                            active_cap,
                             t_cursor,
-                        )?;
-                        t_cursor = ret_seg.t_end;
-                        segments.push(ret_seg);
-                        q_curr = q_retracted;
+                        ) {
+                            t_cursor = ret_seg.t_end;
+                            segments.push(ret_seg);
+                            q_curr = q_retracted;
+                        } else {
+                            let q_retracted = chain.solve_ik(
+                                &q_curr,
+                                p_retract_end,
+                                d_last,
+                                IkMode::Spray { roll_weight: 0.15 },
+                            )?;
+                            push_safe_joint_move(
+                                chain,
+                                &mut segments,
+                                &mut t_cursor,
+                                q_curr,
+                                q_retracted,
+                                gripper_open,
+                                held_can_slot,
+                                active_cap,
+                            );
+                            q_curr = q_retracted;
+                        }
                     }
                 }
 
@@ -518,13 +673,15 @@ impl CompiledTimeline {
                     // 1. Smooth move to raised approach
                     let q_retract =
                         chain.solve_ik_grasp(&q_curr, retract_pos, slot_pose.grasp_rot)?;
-                    push_joint_move(
+                    push_safe_joint_move(
+                        chain,
                         &mut segments,
                         &mut t_cursor,
                         q_curr,
                         q_retract,
                         gripper_open,
                         held_can_slot,
+                        active_cap,
                     );
                     q_curr = q_retract;
 
@@ -539,6 +696,7 @@ impl CompiledTimeline {
                         1.0,
                         gripper_open,
                         held_can_slot,
+                        active_cap,
                         t_cursor,
                     )?;
                     t_cursor = insert_seg.t_end;
@@ -556,13 +714,14 @@ impl CompiledTimeline {
                         0.8,
                         gripper_open,
                         held_can_slot,
+                        active_cap,
                         t_cursor,
                     )?;
                     t_cursor = lower_seg.t_end;
                     segments.push(lower_seg);
                     q_curr = q_at_grasp;
 
-                    // 4. Open gripper 0.25s, held_can_slot = None
+                    // 4. Open gripper 0.25s, held_can_slot = None, active_cap = Fat
                     let t_end_open = t_cursor + GRIPPER_ACTUATE_DURATION;
                     segments.push(TimelineSegment {
                         t_start: t_cursor,
@@ -573,12 +732,15 @@ impl CompiledTimeline {
                             open_end: 1.0,
                             slot_before: held_can_slot,
                             slot_after: None,
+                            cap_before: active_cap,
+                            cap_after: NozzleCap::Fat,
                             switch_at: 0.15,
                         },
                     });
                     t_cursor = t_end_open;
                     gripper_open = 1.0;
                     held_can_slot = None;
+                    active_cap = NozzleCap::Fat;
 
                     // 5. Retract 0.14 * approach_dir
                     let (ret_seg, q_at_approach) = build_cartesian_grasp_segment(
@@ -591,6 +753,7 @@ impl CompiledTimeline {
                         1.0,
                         gripper_open,
                         held_can_slot,
+                        active_cap,
                         t_cursor,
                     )?;
                     t_cursor = ret_seg.t_end;
@@ -598,16 +761,16 @@ impl CompiledTimeline {
                     q_curr = q_at_approach;
                 }
 
-                JobOp::SwapCap { .. } => {}
-
                 JobOp::ParkHome => {
-                    push_joint_move(
+                    push_safe_joint_move(
+                        chain,
                         &mut segments,
                         &mut t_cursor,
                         q_curr,
                         home,
                         gripper_open,
                         held_can_slot,
+                        active_cap,
                     );
                     q_curr = home;
                 }
@@ -648,88 +811,116 @@ impl CompiledTimeline {
         let t_local = (t - seg.t_start).clamp(0.0, (seg.t_end - seg.t_start).max(0.0));
         let seg_dur = (seg.t_end - seg.t_start).max(1e-9);
 
-        let (joints, gripper_open, trigger_depressed, held_can_slot, spray_active, flow_scale) =
-            match &seg.kind {
-                SegmentKind::JointMove {
-                    q_start,
-                    q_end,
-                    profile,
-                    gripper_open,
-                    held_can_slot,
-                } => {
-                    let s = profile.eval(t_local);
-                    let mut q = [0.0; 7];
-                    for i in 0..7 {
-                        q[i] = q_start[i] + (q_end[i] - q_start[i]) * s;
-                    }
-                    (q, *gripper_open, 0.0, *held_can_slot, false, 0.0)
+        let (
+            joints,
+            gripper_open,
+            trigger_depressed,
+            held_can_slot,
+            spray_active,
+            flow_scale,
+            active_cap,
+        ) = match &seg.kind {
+            SegmentKind::JointMove {
+                q_start,
+                q_end,
+                profile,
+                gripper_open,
+                held_can_slot,
+                active_cap,
+            } => {
+                let s = profile.eval(t_local);
+                let mut q = [0.0; 7];
+                for i in 0..7 {
+                    q[i] = q_start[i] + (q_end[i] - q_start[i]) * s;
                 }
+                (q, *gripper_open, 0.0, *held_can_slot, false, 0.0, *active_cap)
+            }
 
-                SegmentKind::GripperActuate {
-                    q,
-                    open_start,
-                    open_end,
-                    slot_before,
-                    slot_after,
-                    switch_at,
-                } => {
-                    let u = (t_local / seg_dur).clamp(0.0, 1.0) as f32;
-                    let g = open_start + (open_end - open_start) * u;
-                    let slot = if u >= *switch_at {
-                        *slot_after
-                    } else {
-                        *slot_before
-                    };
-                    (*q, g, 0.0, slot, false, 0.0)
-                }
+            SegmentKind::GripperActuate {
+                q,
+                open_start,
+                open_end,
+                slot_before,
+                slot_after,
+                cap_before,
+                cap_after,
+                switch_at,
+            } => {
+                let u = (t_local / seg_dur).clamp(0.0, 1.0) as f32;
+                let g = open_start + (open_end - open_start) * u;
+                let (slot, cap) = if u >= *switch_at {
+                    (*slot_after, *cap_after)
+                } else {
+                    (*slot_before, *cap_before)
+                };
+                (*q, g, 0.0, slot, false, 0.0, cap)
+            }
 
-                SegmentKind::ShakeMove {
-                    q_base,
-                    pitch_bounds,
-                    roll_bounds,
-                    held_can_slot,
-                } => {
-                    let ramp = 0.15;
-                    let env = if t_local < ramp {
-                        0.5 * (1.0 - (PI * t_local / ramp).cos())
-                    } else if t_local > seg_dur - ramp {
-                        let rem = (seg_dur - t_local).max(0.0);
-                        0.5 * (1.0 - (PI * rem / ramp).cos())
-                    } else {
-                        1.0
-                    };
-                    let phase = 2.0 * PI * SHAKE_FREQ_HZ * t_local;
-                    let mut q = *q_base;
-                    q[5] = (q_base[5] + env * SHAKE_AMP_RAD * phase.sin())
-                        .clamp(pitch_bounds.0, pitch_bounds.1);
-                    q[4] = (q_base[4] + env * 0.85 * SHAKE_AMP_RAD * (phase + 0.35).sin())
-                        .clamp(roll_bounds.0, roll_bounds.1);
-                    (q, 0.0, 0.0, *held_can_slot, false, 0.0)
-                }
+            SegmentKind::CapSwitchHold {
+                q,
+                held_can_slot,
+                cap_before,
+                cap_after,
+                switch_at,
+            } => {
+                let u = (t_local / seg_dur).clamp(0.0, 1.0) as f32;
+                let cap = if u >= *switch_at {
+                    *cap_after
+                } else {
+                    *cap_before
+                };
+                (*q, 0.0, 0.0, *held_can_slot, false, 0.0, cap)
+            }
 
-                SegmentKind::ArcScaledPath {
-                    samples,
-                    profile,
-                    gripper_open,
-                    held_can_slot,
-                } => {
-                    let total_s = samples.last().map(|s| s.s).unwrap_or(0.0);
-                    let target_s = profile.eval(t_local) * total_s;
-                    let (q, _, _) = interpolate_samples_by_s(samples, target_s);
-                    (q, *gripper_open, 0.0, *held_can_slot, false, 0.0)
-                }
+            SegmentKind::ShakeMove {
+                q_base,
+                pitch_bounds,
+                roll_bounds,
+                held_can_slot,
+                active_cap,
+            } => {
+                let ramp = 0.15;
+                let env = if t_local < ramp {
+                    0.5 * (1.0 - (PI * t_local / ramp).cos())
+                } else if t_local > seg_dur - ramp {
+                    let rem = (seg_dur - t_local).max(0.0);
+                    0.5 * (1.0 - (PI * rem / ramp).cos())
+                } else {
+                    1.0
+                };
+                let phase = 2.0 * PI * SHAKE_FREQ_HZ * t_local;
+                let mut q = *q_base;
+                q[5] = (q_base[5] + env * SHAKE_AMP_RAD * phase.sin())
+                    .clamp(pitch_bounds.0, pitch_bounds.1);
+                q[4] = (q_base[4] + env * 0.85 * SHAKE_AMP_RAD * (phase + 0.35).sin())
+                    .clamp(roll_bounds.0, roll_bounds.1);
+                (q, 0.0, 0.0, *held_can_slot, false, 0.0, *active_cap)
+            }
 
-                SegmentKind::TimedStroke {
-                    samples,
-                    gripper_open,
-                    held_can_slot,
-                } => {
-                    let (q, valve_on, opacity) = interpolate_samples_by_t(samples, t_local);
-                    let trig = if valve_on { 1.0 } else { 0.0 };
-                    let flow = if valve_on { opacity } else { 0.0 };
-                    (q, *gripper_open, trig, *held_can_slot, valve_on, flow)
-                }
-            };
+            SegmentKind::ArcScaledPath {
+                samples,
+                profile,
+                gripper_open,
+                held_can_slot,
+                active_cap,
+            } => {
+                let total_s = samples.last().map(|s| s.s).unwrap_or(0.0);
+                let target_s = profile.eval(t_local) * total_s;
+                let (q, _, _, _) = interpolate_samples_by_s(samples, target_s);
+                (q, *gripper_open, 0.0, *held_can_slot, false, 0.0, *active_cap)
+            }
+
+            SegmentKind::TimedStroke {
+                samples,
+                gripper_open,
+                held_can_slot,
+            } => {
+                let (q, valve_on, opacity, cap) = interpolate_samples_by_t(samples, t_local);
+                let trig = if valve_on { 1.0 } else { 0.0 };
+                let flow = if valve_on { opacity } else { 0.0 };
+                (q, *gripper_open, trig, *held_can_slot, valve_on, flow, cap)
+            }
+        };
 
         let (nozzle_world_pos, nozzle_world_dir, _) = self.chain.fk_nozzle(&joints);
         RobotFrameState {
@@ -741,9 +932,167 @@ impl CompiledTimeline {
             nozzle_world_dir,
             spray_active,
             flow_scale,
-            active_cap: NozzleCap::Fat,
+            active_cap,
         }
     }
+}
+
+/// Evaluates minimum world Z clearance along a joint-space linear interpolation `q_a -> q_b`.
+fn min_joint_path_z(
+    chain: &KinematicChain,
+    q_a: &[f64; 7],
+    q_b: &[f64; 7],
+    held_can: bool,
+    steps: usize,
+) -> f32 {
+    let mut min_z = f32::INFINITY;
+    for k in 0..=steps {
+        let u = k as f64 / steps as f64;
+        let mut q = [0.0; 7];
+        for i in 0..7 {
+            q[i] = q_a[i] + (q_b[i] - q_a[i]) * u;
+        }
+        min_z = min_z.min(chain.min_world_z(&q, held_can));
+    }
+    min_z
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_raw_joint_move(
+    chain: &KinematicChain,
+    segments: &mut Vec<TimelineSegment>,
+    t_cursor: &mut f64,
+    q_from: [f64; 7],
+    q_to: [f64; 7],
+    g_open: f32,
+    can_slot: Option<usize>,
+    active_cap: NozzleCap,
+) {
+    let profile = joint_move_profile(chain, &q_from, &q_to);
+    if profile.duration > 1e-6 {
+        let t_end = *t_cursor + profile.duration;
+        segments.push(TimelineSegment {
+            t_start: *t_cursor,
+            t_end,
+            kind: SegmentKind::JointMove {
+                q_start: q_from,
+                q_end: q_to,
+                profile,
+                gripper_open: g_open,
+                held_can_slot: can_slot,
+                active_cap,
+            },
+        });
+        *t_cursor = t_end;
+    }
+}
+
+/// Pushes a collision-free joint-space transit, folding into a high-clearance posture whenever
+/// direct joint interpolation would dip near the wall canvas (`min_world_z < 0.18m`).
+#[allow(clippy::too_many_arguments)]
+fn push_safe_joint_move(
+    chain: &KinematicChain,
+    segments: &mut Vec<TimelineSegment>,
+    t_cursor: &mut f64,
+    q_from: [f64; 7],
+    q_to: [f64; 7],
+    g_open: f32,
+    can_slot: Option<usize>,
+    active_cap: NozzleCap,
+) {
+    let held_can = can_slot.is_some();
+    let min_z = min_joint_path_z(chain, &q_from, &q_to, held_can, 40);
+    if min_z >= 0.18 {
+        push_raw_joint_move(
+            chain, segments, t_cursor, q_from, q_to, g_open, can_slot, active_cap,
+        );
+        return;
+    }
+
+    let tuck_arm = |q: &[f64; 7]| -> [f64; 7] {
+        chain.clamp_joints(&[q[0], q[1], 0.15, 1.10, q[4], -1.25, q[6]])
+    };
+
+    let mut q_cur = q_from;
+    let (from_noz, from_dir, _) = chain.fk_nozzle(&q_from);
+    let q_tuck_from = tuck_arm(&q_from);
+    let min_z_fold = min_joint_path_z(chain, &q_from, &q_tuck_from, held_can, 40);
+    if min_z_fold < 0.08 && from_dir.z < -0.5 && from_noz.z < 0.25 {
+        if let Ok(q_safe_from) = chain.solve_ik(
+            &q_from,
+            Vec3::new(from_noz.x, from_noz.y, SAFE_TRANSIT_Z.max(from_noz.z + 0.08)),
+            from_dir,
+            IkMode::Spray { roll_weight: 0.15 },
+        ) {
+            if min_joint_path_z(chain, &q_from, &q_safe_from, held_can, 40) > min_z_fold {
+                push_raw_joint_move(
+                    chain,
+                    segments,
+                    t_cursor,
+                    q_cur,
+                    q_safe_from,
+                    g_open,
+                    can_slot,
+                    active_cap,
+                );
+                q_cur = q_safe_from;
+            }
+        }
+    }
+
+    let yaw_crosses_wide = (q_cur[1] - q_to[1]).abs() > 0.35;
+    if yaw_crosses_wide || min_z < 0.18 {
+        let q_fold_cur = tuck_arm(&q_cur);
+        push_raw_joint_move(
+            chain,
+            segments,
+            t_cursor,
+            q_cur,
+            q_fold_cur,
+            g_open,
+            can_slot,
+            active_cap,
+        );
+        q_cur = q_fold_cur;
+    }
+
+    let q_sweep = chain.clamp_joints(&[
+        q_to[0],
+        q_to[1].clamp(-1.35, 1.35),
+        0.15,
+        1.10,
+        0.0,
+        -1.25,
+        0.0,
+    ]);
+    push_raw_joint_move(
+        chain, segments, t_cursor, q_cur, q_sweep, g_open, can_slot, active_cap,
+    );
+    q_cur = q_sweep;
+
+    let (to_noz, to_dir, _) = chain.fk_nozzle(&q_to);
+    let min_z_unfold = min_joint_path_z(chain, &q_cur, &q_to, held_can, 40);
+    if (to_noz.z < 0.25 && to_dir.z < -0.5) || min_z_unfold < 0.05 {
+        if let Ok(q_safe_to) = chain.solve_ik(
+            &q_to,
+            Vec3::new(to_noz.x, to_noz.y, SAFE_TRANSIT_Z.max(to_noz.z + 0.08)),
+            to_dir,
+            IkMode::Spray { roll_weight: 0.15 },
+        ) {
+            let z_a = min_joint_path_z(chain, &q_cur, &q_safe_to, held_can, 40);
+            let z_b = min_joint_path_z(chain, &q_safe_to, &q_to, held_can, 40);
+            if z_a.min(z_b) > min_z_unfold {
+                push_raw_joint_move(
+                    chain, segments, t_cursor, q_cur, q_safe_to, g_open, can_slot, active_cap,
+                );
+                q_cur = q_safe_to;
+            }
+        }
+    }
+
+    push_raw_joint_move(
+        chain, segments, t_cursor, q_cur, q_to, g_open, can_slot, active_cap,
+    );
 }
 
 /// Computes synchronized joint-space S-curve profile strictly respecting all joint velocity & accel limits.
@@ -797,6 +1146,7 @@ fn path_scurve_profile(
     SCurveProfile::new(total_s, v_s_lim, a_s_lim)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_cartesian_grasp_segment(
     chain: &KinematicChain,
     q_start: [f64; 7],
@@ -807,6 +1157,7 @@ fn build_cartesian_grasp_segment(
     a_cart_max: f64,
     gripper_open: f32,
     held_can_slot: Option<usize>,
+    active_cap: NozzleCap,
     t_start: f64,
 ) -> Result<(TimelineSegment, [f64; 7]), String> {
     let dist = (pos_end - pos_start).length() as f64;
@@ -819,6 +1170,7 @@ fn build_cartesian_grasp_segment(
         joints: q_start,
         valve_on: false,
         opacity_scale: 0.0,
+        cap: active_cap,
     });
     let mut q_prev = q_start;
     for k in 1..=steps {
@@ -831,6 +1183,7 @@ fn build_cartesian_grasp_segment(
             joints: q_k,
             valve_on: false,
             opacity_scale: 0.0,
+            cap: active_cap,
         });
         q_prev = q_k;
     }
@@ -846,6 +1199,7 @@ fn build_cartesian_grasp_segment(
                 profile,
                 gripper_open,
                 held_can_slot,
+                active_cap,
             },
         },
         q_prev,
@@ -864,6 +1218,7 @@ fn build_cartesian_nozzle_segment(
     a_cart_max: f64,
     gripper_open: f32,
     held_can_slot: Option<usize>,
+    active_cap: NozzleCap,
     t_start: f64,
 ) -> Result<(TimelineSegment, [f64; 7]), String> {
     let dist = (pos_end - pos_start).length() as f64;
@@ -876,19 +1231,28 @@ fn build_cartesian_nozzle_segment(
         joints: q_start,
         valve_on: false,
         opacity_scale: 0.0,
+        cap: active_cap,
     });
     let mut q_prev = q_start;
     for k in 1..=steps {
         let u = k as f32 / steps as f32;
         let p = pos_start.lerp(pos_end, u);
         let d = dir_start.lerp(dir_end, u).normalize_or(Vec3::NEG_Z);
-        let q_k = chain.solve_ik(&q_prev, p, d, IkMode::Spray { roll_weight: 0.15 })?;
+        let (q_k, reconfigured) =
+            chain.solve_ik_continuous(&q_prev, p, d, IkMode::Spray { roll_weight: 0.15 })?;
+        let max_dq = (0..7)
+            .map(|dof| (q_k[dof] - q_prev[dof]).abs())
+            .fold(0.0_f64, f64::max);
+        if reconfigured || max_dq > 0.25 {
+            return Err("Cartesian nozzle path requires joint reconfiguration".to_string());
+        }
         samples.push(PathSample {
             s: dist * (u as f64),
             t: 0.0,
             joints: q_k,
             valve_on: false,
             opacity_scale: 0.0,
+            cap: active_cap,
         });
         q_prev = q_k;
     }
@@ -904,89 +1268,27 @@ fn build_cartesian_nozzle_segment(
                 profile,
                 gripper_open,
                 held_can_slot,
+                active_cap,
             },
         },
         q_prev,
     ))
 }
 
-fn build_timed_stroke_segment(
+fn finalize_timed_stroke(
     chain: &KinematicChain,
-    q_start: [f64; 7],
-    waypoints: &[StrokeWaypoint],
+    mut samples: Vec<PathSample>,
+    dense_pos: &[Vec3],
+    target_speeds: Vec<f64>,
     gripper_open: f32,
     held_can_slot: Option<usize>,
     t_start: f64,
-) -> Result<(TimelineSegment, [f64; 7]), String> {
-    // 1. Densify stroke at <= 5mm spacing and track continuous IK from q_prev
-    let mut dense_pos = Vec::new();
-    let mut samples = Vec::new();
-    let mut target_speeds = Vec::new();
-
-    let mut q_prev = q_start;
-    let mut s_acc = 0.0_f64;
-
-    for seg_idx in 0..waypoints.len() - 1 {
-        let wp_a = waypoints[seg_idx];
-        let wp_b = waypoints[seg_idx + 1];
-        let p_a = wp_a.nozzle_pos();
-        let p_b = wp_b.nozzle_pos();
-        let d_a = wp_a.spray_dir();
-        let d_b = wp_b.spray_dir();
-
-        let seg_len = (p_b - p_a).length() as f64;
-        if seg_len < 1e-6 {
-            continue;
-        }
-
-        let sub_steps = ((seg_len / 0.005).ceil() as usize).max(1);
-        let seg_valve_on = wp_a.valve_on && wp_b.valve_on;
-        let seg_speed = (0.5 * (wp_a.feed_speed + wp_b.feed_speed)).clamp(0.05, 1.2) as f64;
-        let seg_opacity = 0.5 * (wp_a.opacity_scale + wp_b.opacity_scale);
-
-        let is_first = samples.is_empty();
-        let start_k = if is_first { 0 } else { 1 };
-        for k in start_k..=sub_steps {
-            let u = k as f32 / sub_steps as f32;
-            let p = p_a.lerp(p_b, u);
-            let d = d_a.lerp(d_b, u).normalize_or(Vec3::NEG_Z);
-            if k > 0 {
-                s_acc += (p - *dense_pos.last().unwrap_or(&p)).length() as f64;
-            }
-            let q_k = if is_first && k == 0 {
-                q_start
-            } else {
-                chain.solve_ik(&q_prev, p, d, IkMode::Spray { roll_weight: 0.15 })?
-            };
-            dense_pos.push(p);
-            target_speeds.push(seg_speed);
-            samples.push(PathSample {
-                s: s_acc,
-                t: 0.0,
-                joints: q_k,
-                valve_on: seg_valve_on,
-                opacity_scale: seg_opacity,
-            });
-            q_prev = q_k;
-        }
-    }
-
+) -> Option<TimelineSegment> {
     if samples.len() < 2 {
-        return Ok((
-            TimelineSegment {
-                t_start,
-                t_end: t_start,
-                kind: SegmentKind::TimedStroke {
-                    samples,
-                    gripper_open,
-                    held_can_slot,
-                },
-            },
-            q_prev,
-        ));
+        return None;
     }
 
-    // 2. Forward-backward velocity planning respecting joint limits and corners
+    // Forward-backward velocity planning respecting joint limits and corners
     let n = samples.len();
     let mut v_lim = target_speeds;
     v_lim[0] = 0.0;
@@ -1042,30 +1344,280 @@ fn build_timed_stroke_segment(
     }
 
     let duration = samples[n - 1].t;
-    Ok((
-        TimelineSegment {
-            t_start,
-            t_end: t_start + duration,
-            kind: SegmentKind::TimedStroke {
-                samples,
-                gripper_open,
-                held_can_slot,
-            },
+    if duration <= 1e-6 {
+        return None;
+    }
+    Some(TimelineSegment {
+        t_start,
+        t_end: t_start + duration,
+        kind: SegmentKind::TimedStroke {
+            samples,
+            gripper_open,
+            held_can_slot,
         },
-        q_prev,
-    ))
+    })
 }
 
-fn interpolate_samples_by_s(samples: &[PathSample], target_s: f64) -> ([f64; 7], bool, f32) {
+fn build_timed_stroke_segments(
+    chain: &KinematicChain,
+    q_start: [f64; 7],
+    waypoints: &[StrokeWaypoint],
+    gripper_open: f32,
+    held_can_slot: Option<usize>,
+    segments: &mut Vec<TimelineSegment>,
+    t_cursor: &mut f64,
+) -> Result<[f64; 7], String> {
+    let mut dense_pos: Vec<Vec3> = Vec::new();
+    let mut samples: Vec<PathSample> = Vec::new();
+    let mut target_speeds: Vec<f64> = Vec::new();
+
+    let mut q_prev = q_start;
+    let mut prev_p = waypoints[0].nozzle_pos();
+    let mut prev_d = waypoints[0].spray_dir();
+    let mut prev_cap = waypoints[0].cap;
+    let mut s_acc = 0.0_f64;
+    let mut need_initial_sample = true;
+
+    for seg_idx in 0..waypoints.len() - 1 {
+        let wp_a = waypoints[seg_idx];
+        let wp_b = waypoints[seg_idx + 1];
+        let p_a = wp_a.nozzle_pos();
+        let p_b = wp_b.nozzle_pos();
+        let d_a = wp_a.spray_dir();
+        let d_b = wp_b.spray_dir();
+
+        let seg_len = (p_b - p_a).length() as f64;
+        if seg_len < 1e-6 {
+            continue;
+        }
+
+        let sub_steps = ((seg_len / 0.005).ceil() as usize).max(1);
+        let seg_valve_on = wp_a.valve_on && wp_b.valve_on;
+        let seg_speed = (0.5 * (wp_a.feed_speed + wp_b.feed_speed)).clamp(0.05, 1.2) as f64;
+        let seg_opacity = 0.5 * (wp_a.opacity_scale + wp_b.opacity_scale);
+
+        let start_k = if need_initial_sample { 0 } else { 1 };
+        for k in start_k..=sub_steps {
+            let u = k as f32 / sub_steps as f32;
+            let p = p_a.lerp(p_b, u);
+            let d = d_a.lerp(d_b, u).normalize_or(Vec3::NEG_Z);
+            let cap_k = if k == 0 { wp_a.cap } else { wp_b.cap };
+
+            if need_initial_sample {
+                s_acc = 0.0;
+                dense_pos.push(p);
+                target_speeds.push(seg_speed);
+                samples.push(PathSample {
+                    s: 0.0,
+                    t: 0.0,
+                    joints: q_prev,
+                    valve_on: seg_valve_on,
+                    opacity_scale: seg_opacity,
+                    cap: cap_k,
+                });
+                prev_p = p;
+                prev_d = d;
+                prev_cap = cap_k;
+                need_initial_sample = false;
+                continue;
+            }
+
+            let (q_k, reconfigured) =
+                chain.solve_ik_continuous(&q_prev, p, d, IkMode::Spray { roll_weight: 0.15 })?;
+            let max_dq = (0..7)
+                .map(|dof| (q_k[dof] - q_prev[dof]).abs())
+                .fold(0.0_f64, f64::max);
+
+            // HARD ANTI-SHAKING RULE: never interpolate across a reconfiguration or cap swap while valve_on
+            if reconfigured || max_dq > 0.25 || cap_k != prev_cap {
+                if let Some(stroke_seg) = finalize_timed_stroke(
+                    chain,
+                    std::mem::take(&mut samples),
+                    &dense_pos,
+                    std::mem::take(&mut target_speeds),
+                    gripper_open,
+                    held_can_slot,
+                    *t_cursor,
+                ) {
+                    *t_cursor = stroke_seg.t_end;
+                    segments.push(stroke_seg);
+                } else {
+                    samples.clear();
+                    target_speeds.clear();
+                }
+                dense_pos.clear();
+
+                // 2. Retract +Z with valve_on = false
+                let mut q_curr = q_prev;
+                let p_safe_prev = Vec3::new(prev_p.x, prev_p.y, prev_p.z.max(SAFE_TRANSIT_Z));
+                if (p_safe_prev - prev_p).length() > 1e-3 {
+                    if let Ok((ret_seg, q_ret)) = build_cartesian_nozzle_segment(
+                        chain,
+                        q_curr,
+                        prev_p,
+                        p_safe_prev,
+                        prev_d,
+                        prev_d,
+                        0.45,
+                        1.4,
+                        gripper_open,
+                        held_can_slot,
+                        prev_cap,
+                        *t_cursor,
+                    ) {
+                        *t_cursor = ret_seg.t_end;
+                        segments.push(ret_seg);
+                        q_curr = q_ret;
+                    } else {
+                        let q_ret = chain.solve_ik(
+                            &q_curr,
+                            p_safe_prev,
+                            prev_d,
+                            IkMode::Spray { roll_weight: 0.15 },
+                        )?;
+                        push_safe_joint_move(
+                            chain,
+                            segments,
+                            t_cursor,
+                            q_curr,
+                            q_ret,
+                            gripper_open,
+                            held_can_slot,
+                            prev_cap,
+                        );
+                        q_curr = q_ret;
+                    }
+                }
+
+                // 3. Safe joint move (valve OFF) to reconfigured safe-Z pose
+                let p_safe_next = Vec3::new(p.x, p.y, p.z.max(SAFE_TRANSIT_Z));
+                let q_safe_next = chain.solve_ik(
+                    &q_curr,
+                    p_safe_next,
+                    d,
+                    IkMode::Spray { roll_weight: 0.15 },
+                )?;
+                push_safe_joint_move(
+                    chain,
+                    segments,
+                    t_cursor,
+                    q_curr,
+                    q_safe_next,
+                    gripper_open,
+                    held_can_slot,
+                    cap_k,
+                );
+                q_curr = q_safe_next;
+
+                // 4. Descend -Z (valve OFF) back to (p, d) and resume fresh TimedStroke
+                if (p_safe_next - p).length() > 1e-3 {
+                    if let Ok((desc_seg, q_desc)) = build_cartesian_nozzle_segment(
+                        chain,
+                        q_curr,
+                        p_safe_next,
+                        p,
+                        d,
+                        d,
+                        0.45,
+                        1.4,
+                        gripper_open,
+                        held_can_slot,
+                        cap_k,
+                        *t_cursor,
+                    ) {
+                        *t_cursor = desc_seg.t_end;
+                        segments.push(desc_seg);
+                        q_curr = q_desc;
+                    } else {
+                        let q_desc = chain.solve_ik(
+                            &q_curr,
+                            p,
+                            d,
+                            IkMode::Spray { roll_weight: 0.15 },
+                        )?;
+                        push_safe_joint_move(
+                            chain,
+                            segments,
+                            t_cursor,
+                            q_curr,
+                            q_desc,
+                            gripper_open,
+                            held_can_slot,
+                            cap_k,
+                        );
+                        q_curr = q_desc;
+                    }
+                }
+
+                q_prev = q_curr;
+                prev_p = p;
+                prev_d = d;
+                prev_cap = cap_k;
+                s_acc = 0.0;
+                dense_pos.push(p);
+                target_speeds.push(seg_speed);
+                samples.push(PathSample {
+                    s: 0.0,
+                    t: 0.0,
+                    joints: q_prev,
+                    valve_on: seg_valve_on,
+                    opacity_scale: seg_opacity,
+                    cap: cap_k,
+                });
+            } else {
+                s_acc += (p - prev_p).length() as f64;
+                dense_pos.push(p);
+                target_speeds.push(seg_speed);
+                samples.push(PathSample {
+                    s: s_acc,
+                    t: 0.0,
+                    joints: q_k,
+                    valve_on: seg_valve_on,
+                    opacity_scale: seg_opacity,
+                    cap: cap_k,
+                });
+                q_prev = q_k;
+                prev_p = p;
+                prev_d = d;
+                prev_cap = cap_k;
+            }
+        }
+    }
+
+    if let Some(stroke_seg) = finalize_timed_stroke(
+        chain,
+        samples,
+        &dense_pos,
+        target_speeds,
+        gripper_open,
+        held_can_slot,
+        *t_cursor,
+    ) {
+        *t_cursor = stroke_seg.t_end;
+        segments.push(stroke_seg);
+    }
+
+    Ok(q_prev)
+}
+
+fn interpolate_samples_by_s(
+    samples: &[PathSample],
+    target_s: f64,
+) -> ([f64; 7], bool, f32, NozzleCap) {
     if samples.is_empty() {
-        return ([0.0; 7], false, 0.0);
+        return ([0.0; 7], false, 0.0, NozzleCap::Fat);
     }
     if samples.len() == 1 || target_s <= samples[0].s {
-        return (samples[0].joints, samples[0].valve_on, samples[0].opacity_scale);
+        return (
+            samples[0].joints,
+            samples[0].valve_on,
+            samples[0].opacity_scale,
+            samples[0].cap,
+        );
     }
     let last = &samples[samples.len() - 1];
     if target_s >= last.s {
-        return (last.joints, last.valve_on, last.opacity_scale);
+        return (last.joints, last.valve_on, last.opacity_scale, last.cap);
     }
     let idx = samples.partition_point(|smp| smp.s <= target_s);
     let i0 = idx.saturating_sub(1);
@@ -1081,19 +1633,27 @@ fn interpolate_samples_by_s(samples: &[PathSample], target_s: f64) -> ([f64; 7],
     for dof in 0..7 {
         q[dof] = samples[i0].joints[dof] + (samples[i1].joints[dof] - samples[i0].joints[dof]) * u;
     }
-    (q, samples[i1].valve_on, samples[i1].opacity_scale)
+    (q, samples[i1].valve_on, samples[i1].opacity_scale, samples[i1].cap)
 }
 
-fn interpolate_samples_by_t(samples: &[PathSample], t_local: f64) -> ([f64; 7], bool, f32) {
+fn interpolate_samples_by_t(
+    samples: &[PathSample],
+    t_local: f64,
+) -> ([f64; 7], bool, f32, NozzleCap) {
     if samples.is_empty() {
-        return ([0.0; 7], false, 0.0);
+        return ([0.0; 7], false, 0.0, NozzleCap::Fat);
     }
     if samples.len() == 1 || t_local <= samples[0].t {
-        return (samples[0].joints, samples[0].valve_on, samples[0].opacity_scale);
+        return (
+            samples[0].joints,
+            samples[0].valve_on,
+            samples[0].opacity_scale,
+            samples[0].cap,
+        );
     }
     let last = &samples[samples.len() - 1];
     if t_local >= last.t {
-        return (last.joints, last.valve_on, last.opacity_scale);
+        return (last.joints, last.valve_on, last.opacity_scale, last.cap);
     }
     let idx = samples.partition_point(|smp| smp.t <= t_local);
     let i0 = idx.saturating_sub(1);
@@ -1109,7 +1669,7 @@ fn interpolate_samples_by_t(samples: &[PathSample], t_local: f64) -> ([f64; 7], 
     for dof in 0..7 {
         q[dof] = samples[i0].joints[dof] + (samples[i1].joints[dof] - samples[i0].joints[dof]) * u;
     }
-    (q, samples[i1].valve_on, samples[i1].opacity_scale)
+    (q, samples[i1].valve_on, samples[i1].opacity_scale, samples[i1].cap)
 }
 
 #[cfg(test)]
@@ -1265,5 +1825,161 @@ mod tests {
                 link.pos.x
             );
         }
+    }
+
+    #[test]
+    fn min_world_z_stays_safe_across_pick_swap_strokes_return_park_and_cap_transitions() {
+        let studio = StudioConfig::default();
+        let chain = KinematicChain::default_spraybot(&studio);
+
+        let fat_stroke = vec![
+            StrokeWaypoint {
+                pos: Vec3::new(-1.17, 1.55, 0.0),
+                normal: Vec3::Z,
+                standoff: 0.22,
+                feed_speed: 0.45,
+                valve_on: false,
+                opacity_scale: 1.0,
+                cap: NozzleCap::Fat,
+            },
+            StrokeWaypoint {
+                pos: Vec3::new(-1.10, 1.55, 0.0),
+                normal: Vec3::Z,
+                standoff: 0.22,
+                feed_speed: 0.45,
+                valve_on: true,
+                opacity_scale: 0.9,
+                cap: NozzleCap::Fat,
+            },
+            StrokeWaypoint {
+                pos: Vec3::new(1.10, 1.55, 0.0),
+                normal: Vec3::Z,
+                standoff: 0.22,
+                feed_speed: 0.45,
+                valve_on: true,
+                opacity_scale: 0.9,
+                cap: NozzleCap::Fat,
+            },
+            StrokeWaypoint {
+                pos: Vec3::new(1.17, 1.55, 0.0),
+                normal: Vec3::Z,
+                standoff: 0.22,
+                feed_speed: 0.45,
+                valve_on: false,
+                opacity_scale: 1.0,
+                cap: NozzleCap::Fat,
+            },
+        ];
+
+        let skinny_stroke = vec![
+            StrokeWaypoint {
+                pos: Vec3::new(0.80, 1.85, 0.0),
+                normal: Vec3::Z,
+                standoff: 0.10,
+                feed_speed: 0.35,
+                valve_on: false,
+                opacity_scale: 1.0,
+                cap: NozzleCap::Skinny,
+            },
+            StrokeWaypoint {
+                pos: Vec3::new(0.75, 1.85, 0.0),
+                normal: Vec3::Z,
+                standoff: 0.10,
+                feed_speed: 0.35,
+                valve_on: true,
+                opacity_scale: 1.0,
+                cap: NozzleCap::Skinny,
+            },
+            StrokeWaypoint {
+                pos: Vec3::new(-0.75, 1.85, 0.0),
+                normal: Vec3::Z,
+                standoff: 0.10,
+                feed_speed: 0.35,
+                valve_on: true,
+                opacity_scale: 1.0,
+                cap: NozzleCap::Skinny,
+            },
+            StrokeWaypoint {
+                pos: Vec3::new(-0.80, 1.85, 0.0),
+                normal: Vec3::Z,
+                standoff: 0.10,
+                feed_speed: 0.35,
+                valve_on: false,
+                opacity_scale: 1.0,
+                cap: NozzleCap::Skinny,
+            },
+        ];
+
+        let job = JobPlan {
+            ops: vec![
+                JobOp::PickCan { slot: 5 },
+                JobOp::ShakeCan,
+                JobOp::PaintStroke {
+                    points_canvas_3d: fat_stroke,
+                },
+                JobOp::SwapCap {
+                    cap: NozzleCap::Skinny,
+                },
+                JobOp::PaintStroke {
+                    points_canvas_3d: skinny_stroke,
+                },
+                JobOp::ReturnCan { slot: 5 },
+                JobOp::ParkHome,
+            ],
+        };
+
+        let timeline = CompiledTimeline::compile(&job, &chain, &studio)
+            .expect("Pick -> Fat stroke -> SwapCap -> Skinny stroke -> Return -> Park should compile");
+
+        let dt = 0.005;
+        let steps = (timeline.duration() / dt).ceil() as usize;
+        let mut saw_fat_spray = false;
+        let mut saw_skinny_spray = false;
+        let mut prev_cap = timeline.sample(0.0).active_cap;
+        let mut transitioned_fat_to_skinny = false;
+        let mut transitioned_skinny_to_fat = false;
+
+        for k in 0..=steps {
+            let t = (k as f64 * dt).min(timeline.duration());
+            let frame = timeline.sample(t);
+            let min_z = chain.min_world_z(&frame.joints, frame.held_can_slot.is_some());
+            assert!(
+                min_z > 0.012,
+                "Canvas clearance violation at t={t:.3}: min_world_z={min_z:.4}m (held_can={:?}, spray={})",
+                frame.held_can_slot,
+                frame.spray_active
+            );
+
+            if frame.spray_active {
+                match frame.active_cap {
+                    NozzleCap::Fat => saw_fat_spray = true,
+                    NozzleCap::Skinny => saw_skinny_spray = true,
+                }
+            }
+            if prev_cap == NozzleCap::Fat && frame.active_cap == NozzleCap::Skinny {
+                assert!(!frame.spray_active, "Cap switched while spraying");
+                transitioned_fat_to_skinny = true;
+            }
+            if prev_cap == NozzleCap::Skinny && frame.active_cap == NozzleCap::Fat {
+                assert!(!frame.spray_active, "Cap reset while spraying");
+                transitioned_skinny_to_fat = true;
+            }
+            prev_cap = frame.active_cap;
+        }
+
+        assert!(saw_fat_spray, "Expected Fat cap active during first stroke");
+        assert!(
+            saw_skinny_spray,
+            "Expected Skinny cap active during second stroke"
+        );
+        assert!(
+            transitioned_fat_to_skinny,
+            "Expected Fat -> Skinny active_cap transition during SwapCap"
+        );
+        assert!(
+            transitioned_skinny_to_fat,
+            "Expected Skinny -> Fat active_cap reset on ReturnCan"
+        );
+        assert_eq!(timeline.sample(timeline.duration()).active_cap, NozzleCap::Fat);
     }
 }

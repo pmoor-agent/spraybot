@@ -70,7 +70,7 @@ impl KinematicChain {
                     max: studio.rail_q0_max as f64,
                     max_vel: 1.2,
                     max_accel: 2.5,
-                    ik_weight: 6.0,
+                    ik_weight: 2.5,
                 },
                 JointSpec {
                     name: "base_yaw".to_string(),
@@ -479,7 +479,12 @@ impl KinematicChain {
                 let mut v_null = SVector::<f64, 7>::zeros();
                 for i in 0..7 {
                     let j_spec = &self.joints[i];
-                    let comfort_pull = alpha_null * (self.comfort_pose[i] - q[i]);
+                    let comfort_pull = if i == 0 {
+                        let target_x = target_pos.x.clamp(j_spec.min, j_spec.max);
+                        0.24 * (target_x - q[0])
+                    } else {
+                        alpha_null * (self.comfort_pose[i] - q[i])
+                    };
                     // Soft joint-limit repulsion inside outer 12% of range
                     let span = (j_spec.max - j_spec.min).max(1e-6);
                     let margin = 0.12 * span;
@@ -591,6 +596,91 @@ impl KinematicChain {
             "Nozzle IK did not converge for target {target_pos:?}: pos_err={best_pos:.6}m, rot_err={:.4}deg",
             best_rot.to_degrees()
         ))
+    }
+
+    /// Continuity-preserving nozzle IK solver for dense trajectory tracking.
+    ///
+    /// Runs `solve_dls_internal` from `q_seed` (`max_iters = 36`) and returns `Ok((q1, false))`
+    /// only when tolerances and per-step joint continuity (`max_dof |dq| <= 0.22`) hold.
+    /// Otherwise falls back to [`Self::smart_seed_for_nozzle`] (`32` iters) and returns
+    /// `Ok((q2, true))` so callers can safely retract and reconfigure with the valve off.
+    pub fn solve_ik_continuous(
+        &self,
+        q_seed: &[f64; 7],
+        target_pos: Vec3,
+        target_dir: Vec3,
+        mode: IkMode,
+    ) -> Result<([f64; 7], bool), String> {
+        let p_t = target_pos.as_dvec3();
+        let d_t = target_dir.as_dvec3().normalize();
+        let u_t = DVec3::Y;
+
+        let (q1, pos_err1, rot_err1) =
+            self.solve_dls_internal(q_seed, p_t, d_t, u_t, None, true, mode, 36);
+        let max_dq1 = (0..7)
+            .map(|dof| (q1[dof] - q_seed[dof]).abs())
+            .fold(0.0_f64, f64::max);
+        if pos_err1 <= 1.0e-3 && rot_err1 <= 0.35_f64.to_radians() && max_dq1 <= 0.22 {
+            return Ok((q1, false));
+        }
+
+        let smart = self.smart_seed_for_nozzle(target_pos, target_dir);
+        let (q2, pos_err2, rot_err2) =
+            self.solve_dls_internal(&smart, p_t, d_t, u_t, None, true, mode, 32);
+        if pos_err2 <= 1.0e-3 && rot_err2 <= 0.35_f64.to_radians() {
+            return Ok((q2, true));
+        }
+
+        let (best_q, best_pos, best_rot, reconfigured) = if pos_err2 < pos_err1 {
+            (q2, pos_err2, rot_err2, true)
+        } else {
+            (q1, pos_err1, rot_err1, max_dq1 > 0.22)
+        };
+        if best_pos <= 1.5e-3 && best_rot <= 0.5_f64.to_radians() {
+            return Ok((best_q, reconfigured));
+        }
+        Err(format!(
+            "Continuous nozzle IK did not converge for target {target_pos:?}: pos_err={best_pos:.6}m, rot_err={:.4}deg",
+            best_rot.to_degrees()
+        ))
+    }
+
+    /// Computes a conservative lower bound on world-space `Z` (meters) across all robot links,
+    /// arm midpoints, gripper jaw corners, trigger servo top, and (when `held_can` is true)
+    /// the aerosol can cylinder.
+    pub fn min_world_z(&self, q: &[f64; 7], held_can: bool) -> f32 {
+        const LINK_RADII: [f64; 7] = [0.16, 0.13, 0.08, 0.07, 0.05, 0.05, 0.05];
+        let (frames, grasp_pos, grasp_rot) = self.fk_internal(q);
+        let mut min_z = f64::INFINITY;
+
+        for i in 0..7 {
+            min_z = min_z.min(frames[i].0.z - LINK_RADII[i]);
+        }
+
+        let upper_mid = 0.5 * (frames[2].0 + frames[3].0);
+        let forearm_mid = 0.5 * (frames[3].0 + frames[4].0);
+        min_z = min_z.min(upper_mid.z - 0.07);
+        min_z = min_z.min(forearm_mid.z - 0.07);
+
+        for sx in [-1.0_f64, 1.0_f64] {
+            for sy in [-1.0_f64, 1.0_f64] {
+                let corner = grasp_pos + grasp_rot * DVec3::new(sx * 0.058, sy * 0.022, -0.022);
+                min_z = min_z.min(corner.z);
+            }
+        }
+
+        let trigger_top = grasp_pos + grasp_rot * DVec3::new(0.0, 0.13, 0.01);
+        min_z = min_z.min(trigger_top.z);
+
+        if held_can {
+            let can_radius = 0.034_f64;
+            let top = grasp_pos + grasp_rot * DVec3::new(0.0, 0.105, 0.0);
+            let bottom = grasp_pos + grasp_rot * DVec3::new(0.0, -0.085, 0.0);
+            min_z = min_z.min(top.z - can_radius);
+            min_z = min_z.min(bottom.z - can_radius);
+        }
+
+        min_z as f32
     }
 
     /// Weighted Damped Least-Squares 6-DOF IK solver targeting the gripper grasp frame `(target_pos, target_rot)`.
@@ -830,5 +920,69 @@ mod tests {
                 q_seed = q;
             }
         }
+    }
+
+    #[test]
+    fn horizontal_scanline_234cm_continuous_ik_no_reconfig_or_rail_lag() {
+        let studio = StudioConfig::default();
+        let chain = KinematicChain::default_spraybot(&studio);
+
+        let x_start = -1.17_f32;
+        let x_end = 1.17_f32;
+        let y = 1.55_f32;
+        let z = 0.22_f32;
+        let steps = (((x_end - x_start) / 0.005).round() as usize).max(1);
+
+        let mut q_prev = chain
+            .solve_ik(
+                &chain.comfort_pose,
+                Vec3::new(x_start, y, z),
+                Vec3::NEG_Z,
+                IkMode::Spray { roll_weight: 0.15 },
+            )
+            .expect("Initial scanline IK should succeed");
+
+        for k in 1..=steps {
+            let u = k as f32 / steps as f32;
+            let x = x_start + (x_end - x_start) * u;
+            let (q_k, reconfigured) = chain
+                .solve_ik_continuous(
+                    &q_prev,
+                    Vec3::new(x, y, z),
+                    Vec3::NEG_Z,
+                    IkMode::Spray { roll_weight: 0.15 },
+                )
+                .unwrap_or_else(|e| panic!("Scanline step {k} x={x:.3} failed: {e}"));
+
+            assert!(
+                !reconfigured,
+                "Unexpected reconfiguration at scanline step {k} x={x:.3}"
+            );
+            let max_dq = (0..7)
+                .map(|dof| (q_k[dof] - q_prev[dof]).abs())
+                .fold(0.0_f64, f64::max);
+            assert!(
+                max_dq < 0.06,
+                "Joint step too large at step {k} x={x:.3}: max_dq={max_dq:.5}"
+            );
+            assert!(
+                chain.min_world_z(&q_k, true) > 0.012,
+                "Canvas clearance violated at step {k} x={x:.3}: min_z={:.4}",
+                chain.min_world_z(&q_k, true)
+            );
+            q_prev = q_k;
+        }
+    }
+
+    #[test]
+    fn min_world_z_park_home_is_high_clearance() {
+        let studio = StudioConfig::default();
+        let chain = KinematicChain::default_spraybot(&studio);
+        let park = [1.38, -0.25, 0.15, 1.10, 0.0, -1.25, 0.0];
+        let min_z = chain.min_world_z(&park, false);
+        assert!(
+            min_z >= 0.70,
+            "Expected PARK_HOME min_world_z >= 0.70m, got {min_z:.4}m"
+        );
     }
 }
